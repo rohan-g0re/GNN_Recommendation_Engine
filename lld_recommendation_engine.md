@@ -105,34 +105,172 @@ You can adapt naming, but this structure separates **data**, **ML**, and **servi
 
 ## 4. Configuration and Settings (`config/`)
 
-### 4.1 `config/settings.py`
+### 4.1 `config/constants.py`
 
-Define global configuration and hyperparameters:
+**CRITICAL**: These constants MUST match exactly between training and serving.
 
-- **Paths**:
-  - `DATA_DIR`: base directory for synthetic and processed data.
-  - `USERS_FILE`, `PLACES_FILE`, `INTERACTIONS_FILE`, `USER_USER_EDGES_FILE`, `FRIEND_LABELS_FILE`.
-  - `GRAPH_FILE`: serialized graph object path.
-  - `MODEL_CHECKPOINT_DIR`, `EMBEDDING_DIR`, `INDEX_DIR`.
+```python
+# File: recsys/config/constants.py
 
-- **Model hyperparameters**:
-  - `D_MODEL` (embedding dimension).
-  - `NUM_GNN_LAYERS`.
-  - `LEARNING_RATE`, `WEIGHT_DECAY`.
-  - `LAMBDA_PLACE`, `LAMBDA_FRIEND`, `LAMBDA_ATTEND`.
-  - `BATCH_SIZE_PLACE`, `BATCH_SIZE_FRIEND`.
+# Scale parameters
+N_USERS = 10_000
+N_PLACES = 10_000
+N_CITIES = 8
+N_NEIGHBORHOODS_PER_CITY = 15
 
-- **Data generation parameters**:
-  - `N_USERS`, `N_PLACES`, `N_CITIES`, `COARSE_CATEGORIES`, `FINE_TAGS`, `VIBE_TAGS`.
+# Feature dimensions (MUST MATCH between all modules)
+C_COARSE = 6  # Number of coarse categories
+C_FINE = 100  # Number of fine-grained tags
+C_VIBE = 30   # Number of vibe/personality tags
 
-- **Serving parameters**:
-  - `TOP_M_CANDIDATES` (e.g., 200).
-  - `TOP_K_RESULTS` (e.g., 10–20).
-  - ANN index settings.
+# Computed feature dimensions
+D_USER_RAW = 148  # User feature vector dimension
+D_PLACE_RAW = 114  # Place feature vector dimension
+D_EDGE_UP = 12    # User-place edge features
+D_EDGE_UU = 3     # User-user edge features
 
-Implementation:
+MAX_NEIGHBORHOODS_PER_USER = 5  # Fixed-size for area_freqs
 
-- Use a Pydantic `BaseSettings` or a simple `Settings` class instanced at import time.
+# Coarse categories (0-indexed)
+COARSE_CATEGORIES = [
+    "entertainment",  # 0
+    "sports",         # 1
+    "clubs",          # 2
+    "dining",         # 3
+    "outdoors",       # 4
+    "culture"         # 5
+]
+
+# Fine tags (0-indexed, example subset shown)
+FINE_TAGS = [
+    "fishing", "bouldering", "techno", "live_music", "board_games",
+    "rooftop", "brunch", "karaoke", "jazz", "trivia",
+    # ... 90 more to total 100
+]
+
+# Vibe tags (0-indexed, example subset shown)
+VIBE_TAGS = [
+    "introvert", "extrovert", "party", "fitness", "artsy",
+    "night_owl", "early_bird", "foodie", "adventurous", "chill",
+    # ... 20 more to total 30
+]
+
+# Time slots
+TIME_SLOTS = ["morning", "afternoon", "evening", "night", "weekend_day", "weekend_night"]
+N_TIME_SLOTS = len(TIME_SLOTS)
+
+# Time of day buckets (for interactions)
+TIME_OF_DAY_BUCKETS = ["morning", "afternoon", "evening", "night"]
+N_TIME_OF_DAY = 4
+
+# Day of week buckets
+DAY_OF_WEEK_BUCKETS = ["weekday", "weekend"]
+N_DAY_OF_WEEK = 2
+
+# Price bands
+N_PRICE_BANDS = 5  # 0-4
+```
+
+### 4.2 `config/model_config.py`
+
+**CRITICAL**: Model configuration shared between training and serving.
+
+```python
+# File: recsys/config/model_config.py
+
+from dataclasses import dataclass
+
+@dataclass
+class ModelConfig:
+    """
+    Hyperparameters for GNN model.
+    MUST be consistent between training and serving.
+    """
+    # Embedding dimension
+    D_MODEL: int = 128  # Output dimension of encoders and GNN layers
+    
+    # Encoder architecture
+    CITY_EMBED_DIM: int = 16
+    NEIGHBORHOOD_EMBED_DIM: int = 32
+    PRICE_EMBED_DIM: int = 8
+    TIME_SLOT_EMBED_DIM: int = 8
+    
+    # GNN backbone
+    NUM_GNN_LAYERS: int = 2  # Number of message passing layers
+    GNN_HIDDEN_DIM: int = 128  # Hidden dimension in conv layers
+    GNN_DROPOUT: float = 0.1
+    GNN_AGGR: str = 'mean'  # Aggregation: 'mean', 'sum', or 'attention'
+    
+    # Task heads
+    PLACE_HEAD_HIDDEN: list = None  # [256, 128]
+    FRIEND_HEAD_HIDDEN: list = None  # [256, 128]
+    HEAD_DROPOUT: float = 0.2
+    
+    # Context vector dimensions
+    D_CTX_PLACE: int = 16  # Dimension of place context vector
+    D_CTX_FRIEND: int = 16  # Dimension of friend context vector
+    
+    # Training
+    LEARNING_RATE: float = 1e-3
+    WEIGHT_DECAY: float = 1e-5
+    BATCH_SIZE_PLACE: int = 512
+    BATCH_SIZE_FRIEND: int = 512
+    
+    # Loss weights
+    LAMBDA_PLACE: float = 1.0
+    LAMBDA_FRIEND: float = 0.5
+    LAMBDA_ATTEND: float = 0.3
+    
+    def __post_init__(self):
+        if self.PLACE_HEAD_HIDDEN is None:
+            self.PLACE_HEAD_HIDDEN = [256, 128]
+        if self.FRIEND_HEAD_HIDDEN is None:
+            self.FRIEND_HEAD_HIDDEN = [256, 128]
+```
+
+### 4.3 `config/settings.py`
+
+File paths and runtime settings:
+
+```python
+# File: recsys/config/settings.py
+
+from pathlib import Path
+
+# Base directories
+PROJECT_ROOT = Path(__file__).parent.parent.parent
+DATA_DIR = PROJECT_ROOT / "data"
+MODEL_DIR = PROJECT_ROOT / "models"
+OUTPUT_DIR = PROJECT_ROOT / "output"
+
+# Data files
+USERS_FILE = DATA_DIR / "users.parquet"
+PLACES_FILE = DATA_DIR / "places.parquet"
+INTERACTIONS_FILE = DATA_DIR / "interactions.parquet"
+USER_USER_EDGES_FILE = DATA_DIR / "user_user_edges.parquet"
+FRIEND_LABELS_FILE = DATA_DIR / "friend_labels.parquet"
+
+# Graph and mappings
+GRAPH_FILE = DATA_DIR / "hetero_graph.pt"
+USER_ID_MAPPINGS_FILE = DATA_DIR / "user_id_mappings.pkl"
+PLACE_ID_MAPPINGS_FILE = DATA_DIR / "place_id_mappings.pkl"
+
+# Model checkpoints
+MODEL_CHECKPOINT_DIR = MODEL_DIR / "checkpoints"
+FINAL_MODEL_PATH = MODEL_DIR / "final_model.pt"
+
+# Embeddings
+EMBEDDING_DIR = DATA_DIR / "embeddings"
+USER_EMBEDDINGS_FILE = EMBEDDING_DIR / "user_embeddings.parquet"
+PLACE_EMBEDDINGS_FILE = EMBEDDING_DIR / "place_embeddings.parquet"
+
+# ANN indices
+INDEX_DIR = DATA_DIR / "indices"
+
+# Serving parameters
+TOP_M_CANDIDATES = 200  # ANN retrieval count
+TOP_K_RESULTS = 10      # Final recommendations
+```
 
 ---
 
@@ -140,63 +278,212 @@ Implementation:
 
 ### 5.1 Schemas (`data/schemas.py`)
 
-Define dataclasses or Pydantic models to represent rows from data sources.
+**CRITICAL**: All dimensions and field names must match exactly.
 
-- **`UserSchema`**
-  - `user_id: int`
-  - `home_city_id: int`
-  - `home_neighborhood_id: int`
-  - `cat_pref: List[float]` (length = `C_coarse`)
-  - `fine_pref: List[float]` (length = `C_fine`)
-  - `vibe_pref: List[float]` (length = `C_vibe`)
-  - `area_freqs: Dict[int, float]` (neighborhood → weight)
-  - `avg_sessions_per_week: float`
-  - `avg_views_per_session: float`
-  - `avg_likes_per_session: float`
-  - `avg_saves_per_session: float`
-  - `avg_attends_per_month: float`
+```python
+# File: recsys/data/schemas.py
 
-- **`PlaceSchema`**
-  - `place_id: int`
-  - `city_id: int`
-  - `neighborhood_id: int`
-  - `category_ids: List[int]`
-  - `category_one_hot: List[float]`
-  - `fine_tag_vector: List[float]`
-  - `price_band: int`
-  - `typical_time_slot: int`
-  - `base_popularity: float`
-  - `avg_daily_visits: float`
-  - `conversion_rate: float`
-  - `novelty_score: float`
+from dataclasses import dataclass
+from typing import List, Dict, Optional
+from datetime import datetime
+import numpy as np
 
-- **`InteractionSchema`**
-  - `user_id: int`
-  - `place_id: int`
-  - `dwell_time: float`
-  - `num_likes: int`
-  - `num_saves: int`
-  - `num_shares: int`
-  - `attended: bool`
-  - `implicit_rating: float`
-  - `timestamp: datetime`
-  - `time_of_day_bucket: int`
-  - `day_of_week_bucket: int`
+@dataclass
+class UserSchema:
+    """
+    User data schema.
+    Raw feature dimension: 148
+    """
+    # Identity
+    user_id: int  # 0 to N_USERS-1
+    
+    # Location (categorical, will be embedded)
+    home_city_id: int  # 0 to N_CITIES-1
+    home_neighborhood_id: int  # 0 to N_NEIGHBORHOODS_PER_CITY-1
+    
+    # Preference vectors (pre-normalized, sum to 1.0)
+    cat_pref: List[float]  # Length C_COARSE=6
+    fine_pref: List[float]  # Length C_FINE=100
+    vibe_pref: List[float]  # Length C_VIBE=30
+    
+    # Location behavior (will be converted to fixed-size vector)
+    area_freqs: Dict[int, float]  # neighborhood_id -> weight, sums to 1.0
+    
+    # Behavioral statistics (continuous, normalized to [0,1])
+    avg_sessions_per_week: float
+    avg_views_per_session: float
+    avg_likes_per_session: float
+    avg_saves_per_session: float
+    avg_attends_per_month: float
+    
+    # Optional demographics
+    age_group: Optional[int] = None
+    gender: Optional[int] = None
 
-- **`UserUserEdgeSchema`**
-  - `user_u: int`
-  - `user_v: int`
-  - `interest_overlap_score: float`
-  - `co_attendance_count: int`
-  - `same_neighborhood_freq: float`
 
-- **`FriendLabelSchema`**
-  - `user_u: int`
-  - `user_v: int`
-  - `label_compat: int` (0/1)
-  - `label_attend: int` (0/1)
+@dataclass
+class PlaceSchema:
+    """
+    Place data schema.
+    Raw feature dimension: 114
+    """
+    # Identity
+    place_id: int  # 0 to N_PLACES-1
+    
+    # Location
+    city_id: int  # 0 to N_CITIES-1
+    neighborhood_id: int  # 0 to N_NEIGHBORHOODS_PER_CITY-1
+    
+    # Categories (can be multi-label)
+    category_ids: List[int]  # Indices into COARSE_CATEGORIES
+    category_one_hot: List[float]  # Length C_COARSE=6, binary or weighted
+    
+    # Fine-grained tags (normalized, sum to 1.0)
+    fine_tag_vector: List[float]  # Length C_FINE=100
+    
+    # Operational attributes
+    price_band: int  # 0-4
+    typical_time_slot: int  # 0-5
+    
+    # Popularity metrics
+    base_popularity: float  # Raw popularity score
+    avg_daily_visits: float  # Derived
+    conversion_rate: float  # 0-1
+    novelty_score: float  # 0-1
 
-These schemas make it easier to manipulate records before converting them into tensors.
+
+@dataclass
+class InteractionSchema:
+    """
+    User-place interaction.
+    Edge feature dimension: 12
+    """
+    # Foreign keys
+    user_id: int
+    place_id: int
+    
+    # Engagement metrics
+    dwell_time: float  # Seconds
+    num_likes: int
+    num_saves: int
+    num_shares: int
+    attended: bool
+    
+    # Derived implicit rating (1.0-5.0)
+    implicit_rating: float
+    
+    # Temporal context
+    timestamp: datetime
+    time_of_day_bucket: int  # 0-3
+    day_of_week_bucket: int  # 0-1
+
+
+@dataclass
+class UserUserEdgeSchema:
+    """
+    User-user social edge.
+    Edge feature dimension: 3
+    """
+    user_u: int  # Smaller ID
+    user_v: int  # Larger ID
+    
+    # Edge strength features
+    interest_overlap_score: float  # 0-1, cosine similarity
+    co_attendance_count: int  # Number of co-attended places
+    same_neighborhood_freq: float  # 0-1, overlap in area_freqs
+
+
+@dataclass
+class FriendLabelSchema:
+    """
+    Supervision labels for friend compatibility.
+    """
+    user_u: int
+    user_v: int
+    label_compat: int  # 0 or 1
+    label_attend: int  # 0 or 1
+```
+
+### 5.1.1 Implicit Rating Computation
+
+**CRITICAL**: This formula must be used consistently for synthetic data generation and preprocessing.
+
+```python
+# File: recsys/data/schemas.py (continued)
+
+def compute_implicit_rating(
+    dwell_time: float,
+    num_likes: int,
+    num_saves: int,
+    num_shares: int,
+    attended: bool
+) -> float:
+    """
+    Convert engagement signals to 1-5 rating scale.
+    
+    Formula:
+    - Base: 1.0
+    - +min(dwell_time / 150, 2.0) for dwell
+    - +min(num_likes * 0.5, 1.5) for likes
+    - +min(num_saves * 1.0, 2.0) for saves
+    - +min(num_shares * 0.5, 1.0) for shares
+    - +2.0 if attended
+    - Cap at 5.0
+    """
+    score = 1.0
+    score += min(dwell_time / 150.0, 2.0)
+    score += min(num_likes * 0.5, 1.5)
+    score += min(num_saves * 1.0, 2.0)
+    score += min(num_shares * 0.5, 1.0)
+    if attended:
+        score += 2.0
+    return min(score, 5.0)
+```
+
+### 5.1.2 Data Validation
+
+```python
+# File: recsys/data/validators.py
+
+from recsys.config.constants import *
+
+def validate_user_schema(user: UserSchema) -> None:
+    """Validate user data integrity."""
+    assert 0 <= user.user_id < N_USERS
+    assert 0 <= user.home_city_id < N_CITIES
+    assert 0 <= user.home_neighborhood_id < N_NEIGHBORHOODS_PER_CITY
+    
+    assert len(user.cat_pref) == C_COARSE
+    assert abs(sum(user.cat_pref) - 1.0) < 1e-5, "cat_pref must sum to 1"
+    
+    assert len(user.fine_pref) == C_FINE
+    assert abs(sum(user.fine_pref) - 1.0) < 1e-5, "fine_pref must sum to 1"
+    
+    assert len(user.vibe_pref) == C_VIBE
+    assert abs(sum(user.vibe_pref) - 1.0) < 1e-5, "vibe_pref must sum to 1"
+    
+    assert all(v >= 0 for v in user.area_freqs.values())
+    assert abs(sum(user.area_freqs.values()) - 1.0) < 1e-5
+    
+    assert user.avg_sessions_per_week > 0
+    assert user.avg_views_per_session > 0
+
+
+def validate_place_schema(place: PlaceSchema) -> None:
+    """Validate place data integrity."""
+    assert 0 <= place.place_id < N_PLACES
+    assert 0 <= place.city_id < N_CITIES
+    assert 0 <= place.neighborhood_id < N_NEIGHBORHOODS_PER_CITY
+    
+    assert len(place.category_one_hot) == C_COARSE
+    assert all(0 <= v <= 1 for v in place.category_one_hot)
+    
+    assert len(place.fine_tag_vector) == C_FINE
+    assert abs(sum(place.fine_tag_vector) - 1.0) < 1e-5
+    
+    assert 0 <= place.price_band < N_PRICE_BANDS
+    assert 0 <= place.typical_time_slot < N_TIME_SLOTS
+```
 
 ### 5.2 Repositories (`data/repositories.py`)
 

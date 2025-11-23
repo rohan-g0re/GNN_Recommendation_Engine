@@ -1152,248 +1152,1521 @@ class GraphRecBackbone(nn.Module):
         return {'user': z_user, 'place': z_place}
 ```
 
-### 4.3 Task Heads
+### 4.4 Task Heads Implementation
 
-We add two separate heads on top of the shared backbone.
+**File**: `recsys/ml/models/heads.py`
 
-#### 4.3.1 Place Recommendation Head
+```python
+import torch
+import torch.nn as nn
 
-- Inputs:
-  - User embedding: \\(z_u\\).
-  - Place embedding: \\(z_p\\).
-  - Context vector \\(c_\text{ctx}\\), encoding:
-    - Query city (if specified).
-    - Desired time slot (e.g., tonight, weekend).
-    - Optional desired coarse category and/or fine tags (mood).
+class PlaceHead(nn.Module):
+    """
+    Scoring head for user-place recommendations.
+    
+    Takes user embedding, place embedding, and context.
+    Outputs scalar relevance score.
+    """
+    
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.config = config
+        
+        # Input dimension: z_u + z_p + z_u*z_p + |z_u-z_p| + ctx
+        # = D_MODEL + D_MODEL + D_MODEL + D_MODEL + D_CTX_PLACE
+        # = 4 * D_MODEL + D_CTX_PLACE
+        input_dim = 4 * config.D_MODEL + config.D_CTX_PLACE
+        
+        # Build MLP
+        layers = []
+        prev_dim = input_dim
+        
+        for hidden_dim in config.PLACE_HEAD_HIDDEN:
+            layers.extend([
+                nn.Linear(prev_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(config.HEAD_DROPOUT)
+            ])
+            prev_dim = hidden_dim
+        
+        # Final scoring layer
+        layers.append(nn.Linear(prev_dim, 1))
+        
+        self.mlp = nn.Sequential(*layers)
+    
+    def forward(
+        self,
+        z_user: torch.Tensor,
+        z_place: torch.Tensor,
+        ctx: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Args:
+            z_user: (batch_size, D_MODEL) user embeddings
+            z_place: (batch_size, D_MODEL) place embeddings
+            ctx: (batch_size, D_CTX_PLACE) context features
+        
+        Returns:
+            (batch_size, 1) relevance scores
+        """
+        # Construct interaction features
+        z_mul = z_user * z_place  # Element-wise product
+        z_diff = torch.abs(z_user - z_place)  # Absolute difference
+        
+        # Concatenate all features
+        features = torch.cat([z_user, z_place, z_mul, z_diff, ctx], dim=1)
+        
+        # Score
+        score = self.mlp(features)  # (batch_size, 1)
+        
+        return score.squeeze(-1)  # (batch_size,)
 
-- Construct feature vector:
 
-\\[
-f_{up} = [ z_u, z_p, z_u \odot z_p, |z_u - z_p|, c_\text{ctx} ]
-\\]
+class ContextEncoder(nn.Module):
+    """
+    Encodes context features for place/friend recommendations.
+    """
+    
+    def __init__(self, output_dim: int):
+        super().__init__()
+        self.output_dim = output_dim
+        
+        # Embeddings for context
+        self.city_embed = nn.Embedding(N_CITIES, 8)
+        self.time_slot_embed = nn.Embedding(N_TIME_SLOTS, 8)
+        
+        # For optional desired category/tags (multi-hot input)
+        # Input: C_COARSE + small MLP
+        self.category_proj = nn.Linear(C_COARSE, output_dim // 2)
+        
+        # Combined projection
+        self.proj = nn.Linear(8 + 8 + output_dim // 2, output_dim)
+    
+    def forward(
+        self,
+        city_id: torch.Tensor,
+        time_slot: torch.Tensor,
+        desired_categories: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Args:
+            city_id: (batch_size,) city IDs
+            time_slot: (batch_size,) time slot IDs
+            desired_categories: (batch_size, C_COARSE) multi-hot desired categories
+        
+        Returns:
+            (batch_size, output_dim) context vector
+        """
+        city_emb = self.city_embed(city_id)
+        time_emb = self.time_slot_embed(time_slot)
+        cat_emb = torch.relu(self.category_proj(desired_categories))
+        
+        combined = torch.cat([city_emb, time_emb, cat_emb], dim=1)
+        ctx = self.proj(combined)
+        
+        return ctx
 
-- Pass through an MLP:
 
-\\[
-s_\text{place} = \text{MLP}_\text{place}(f_{up}) \in \mathbb{R}
-\\]
-
-This scalar is the **relevance score** of place \\(p\\) for user \\(u\\) under context \\(c_\text{ctx}\\).
-
-#### 4.3.2 Friend / People Compatibility Head
-
-- Inputs:
-  - Query user embedding \\(z_u\\).
-  - Candidate user embedding \\(z_v\\).
-  - Optional context \\(c_\text{friend}\\):
-    - Candidate place or activity tag.
-    - City, desired time slot, etc.
-
-- Construct feature vector:
-
-\\[
-f_{uv} = [ z_u, z_v, z_u \odot z_v, |z_u - z_v|, c_\text{friend} ]
-\\]
-
-- Two outputs:
-  - **Compatibility score**:
-
-    \\[
-    s_\text{compat} = \text{MLP}_\text{compat}(f_{uv})
-    \\]
-
-  - **Attendance / acceptance probability**:
-
-    \\[
-    p_\text{attend} = \sigma(\text{MLP}_\text{attend}(f_{uv}))
-    \\]
-
-- Combined score (for ranking):
-
-\\[
-s_\text{final} = \alpha \, s_\text{compat} + (1 - \alpha) \, p_\text{attend}
-\\]
-
-with \\(\alpha \in [0, 1]\\) a tunable hyperparameter.
+class FriendHead(nn.Module):
+    """
+    Scoring head for user-user compatibility.
+    
+    Outputs two scores:
+    - Compatibility score (how well they match)
+    - Attendance probability (likelihood to accept/attend)
+    """
+    
+    def __init__(self, config: ModelConfig):
+        super().__init__()
+        self.config = config
+        
+        # Input dimension
+        input_dim = 4 * config.D_MODEL + config.D_CTX_FRIEND
+        
+        # Shared trunk
+        trunk_layers = []
+        prev_dim = input_dim
+        
+        for hidden_dim in config.FRIEND_HEAD_HIDDEN[:-1]:
+            trunk_layers.extend([
+                nn.Linear(prev_dim, hidden_dim),
+                nn.LayerNorm(hidden_dim),
+                nn.ReLU(),
+                nn.Dropout(config.HEAD_DROPOUT)
+            ])
+            prev_dim = hidden_dim
+        
+        self.trunk = nn.Sequential(*trunk_layers)
+        
+        # Compatibility head (outputs logit)
+        self.compat_head = nn.Sequential(
+            nn.Linear(prev_dim, config.FRIEND_HEAD_HIDDEN[-1]),
+            nn.ReLU(),
+            nn.Linear(config.FRIEND_HEAD_HIDDEN[-1], 1)
+        )
+        
+        # Attendance probability head (outputs logit, will apply sigmoid)
+        self.attend_head = nn.Sequential(
+            nn.Linear(prev_dim, config.FRIEND_HEAD_HIDDEN[-1]),
+            nn.ReLU(),
+            nn.Linear(config.FRIEND_HEAD_HIDDEN[-1], 1)
+        )
+    
+    def forward(
+        self,
+        z_user_u: torch.Tensor,
+        z_user_v: torch.Tensor,
+        ctx: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Args:
+            z_user_u: (batch_size, D_MODEL) query user embeddings
+            z_user_v: (batch_size, D_MODEL) candidate user embeddings
+            ctx: (batch_size, D_CTX_FRIEND) context features
+        
+        Returns:
+            compat_score: (batch_size,) compatibility scores (logits)
+            attend_prob: (batch_size,) attendance probabilities (0-1)
+        """
+        # Construct interaction features
+        z_mul = z_user_u * z_user_v
+        z_diff = torch.abs(z_user_u - z_user_v)
+        
+        # Concatenate
+        features = torch.cat([z_user_u, z_user_v, z_mul, z_diff, ctx], dim=1)
+        
+        # Shared representation
+        shared = self.trunk(features)
+        
+        # Two heads
+        compat_logits = self.compat_head(shared).squeeze(-1)  # (batch_size,)
+        attend_logits = self.attend_head(shared).squeeze(-1)
+        attend_prob = torch.sigmoid(attend_logits)  # (batch_size,)
+        
+        return compat_logits, attend_prob
+    
+    def compute_combined_score(
+        self,
+        compat_score: torch.Tensor,
+        attend_prob: torch.Tensor,
+        alpha: float = 0.7
+    ) -> torch.Tensor:
+        """
+        Combine compatibility and attendance into final ranking score.
+        
+        Args:
+            compat_score: Compatibility scores (logits or normalized)
+            attend_prob: Attendance probabilities (0-1)
+            alpha: Weight for compatibility (1-alpha for attendance)
+        
+        Returns:
+            Combined scores
+        """
+        # Normalize compat_score to [0, 1] via sigmoid
+        compat_norm = torch.sigmoid(compat_score)
+        
+        return alpha * compat_norm + (1 - alpha) * attend_prob
+```
 
 ---
 
-## 5. Training Objectives and Losses
+## 5. Training Pipeline (PyTorch Implementation)
 
-We jointly train the model on:
+### 5.1 Loss Functions
 
-- **Place recommendation task** (user–place).
-- **Friend / people compatibility task** (user–user).
+**File**: `recsys/ml/models/losses.py`
 
-### 5.1 Place Recommendation Loss
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-- **Positive samples**:
-  - User–place interactions where `implicit_rating` is high:
-    - Strong behavioral signals like:
-      - High dwell time.
-      - Likes/saves.
-      - Attended flag.
+def bpr_loss(pos_scores: torch.Tensor, neg_scores: torch.Tensor) -> torch.Tensor:
+    """
+    Bayesian Personalized Ranking loss.
+    
+    Args:
+        pos_scores: (batch_size,) scores for positive items
+        neg_scores: (batch_size,) scores for negative items
+    
+    Returns:
+        Scalar loss
+    """
+    # Loss = -log(sigmoid(pos - neg))
+    # = log(1 + exp(-(pos - neg)))
+    # = softplus(neg - pos)
+    loss = F.softplus(neg_scores - pos_scores).mean()
+    return loss
 
-- **Negative samples**:
-  - Places that the user has **not** interacted with.
-  - To make the task meaningful:
-    - Sample negatives within the **same city**.
-    - Optionally within the same **coarse category**.
 
-- **Loss options**:
-  - **BPR (Bayesian Personalized Ranking) loss**:
+def binary_cross_entropy_loss(
+    logits: torch.Tensor,
+    labels: torch.Tensor
+) -> torch.Tensor:
+    """
+    Binary cross-entropy loss with logits.
+    
+    Args:
+        logits: (batch_size,) predicted logits
+        labels: (batch_size,) binary labels (0 or 1)
+    
+    Returns:
+        Scalar loss
+    """
+    return F.binary_cross_entropy_with_logits(logits, labels.float())
 
-    For each triplet \\((u, p^+, p^-)\\):
 
-    \\[
-    \mathcal{L}_\text{place} = -\log \sigma( s_\text{place}(u, p^+) - s_\text{place}(u, p^-) )
-    \\]
+class CombinedLoss(nn.Module):
+    """
+    Combined loss for multi-task GNN training.
+    """
+    
+    def __init__(
+        self,
+        lambda_place: float = 1.0,
+        lambda_friend: float = 0.5,
+        lambda_attend: float = 0.3
+    ):
+        super().__init__()
+        self.lambda_place = lambda_place
+        self.lambda_friend = lambda_friend
+        self.lambda_attend = lambda_attend
+    
+    def forward(
+        self,
+        loss_place: torch.Tensor,
+        loss_friend: torch.Tensor,
+        loss_attend: torch.Tensor
+    ) -> tuple[torch.Tensor, dict]:
+        """
+        Combine losses with weights.
+        
+        Returns:
+            total_loss: Weighted sum
+            loss_dict: Individual loss values for logging
+        """
+        total_loss = (
+            self.lambda_place * loss_place +
+            self.lambda_friend * loss_friend +
+            self.lambda_attend * loss_attend
+        )
+        
+        loss_dict = {
+            'loss_place': loss_place.item(),
+            'loss_friend': loss_friend.item(),
+            'loss_attend': loss_attend.item(),
+            'loss_total': total_loss.item()
+        }
+        
+        return total_loss, loss_dict
+```
 
-  - Or **binary cross-entropy** on `(u, p)` pairs, with labels 1 (positive) / 0 (negative).
+### 5.2 Dataset and Samplers
 
-### 5.2 Friend / People Compatibility Loss
+**File**: `recsys/ml/training/datasets.py`
 
-- **Positive pairs** `(u, v)`:
-  - Users who:
-    - Have co-attended events/places (synthetic or real).
-    - Or have high social edge strength.
+```python
+import torch
+from torch.utils.data import Dataset
+import numpy as np
+from typing import List, Dict
+import random
 
-- **Negative pairs** `(u, v)`:
-  - Users in the same city with:
-    - Low interest overlap.
-    - No co-attendance.
+class PlaceRecommendationDataset(Dataset):
+    """
+    Dataset for place recommendation task with BPR sampling.
+    
+    For each user-place positive interaction, samples a negative place.
+    """
+    
+    def __init__(
+        self,
+        interactions: List[InteractionSchema],
+        user_id_to_index: Dict[int, int],
+        place_id_to_index: Dict[int, int],
+        places: List[PlaceSchema],
+        rating_threshold: float = 3.5,
+        negatives_per_positive: int = 1
+    ):
+        """
+        Args:
+            interactions: All user-place interactions
+            user_id_to_index: Mapping user_id -> graph index
+            place_id_to_index: Mapping place_id -> graph index
+            places: List of all places
+            rating_threshold: Min implicit_rating to consider positive
+            negatives_per_positive: How many negatives to sample per positive
+        """
+        self.user_id_to_index = user_id_to_index
+        self.place_id_to_index = place_id_to_index
+        
+        # Filter positive interactions
+        self.positives = [
+            (inter.user_id, inter.place_id)
+            for inter in interactions
+            if inter.implicit_rating >= rating_threshold
+        ]
+        
+        # Build user -> positive places mapping
+        self.user_to_pos_places = {}
+        for user_id, place_id in self.positives:
+            if user_id not in self.user_to_pos_places:
+                self.user_to_pos_places[user_id] = set()
+            self.user_to_pos_places[user_id].add(place_id)
+        
+        # Build city -> places mapping for negative sampling
+        self.city_to_places = {}
+        for place in places:
+            if place.city_id not in self.city_to_places:
+                self.city_to_places[place.city_id] = []
+            self.city_to_places[place.city_id].append(place.place_id)
+        
+        # Store user home cities
+        # (Assume we have access to users list or can derive from interactions)
+        self.user_to_city = {}  # To be filled externally
+        
+        self.negatives_per_positive = negatives_per_positive
+    
+    def __len__(self):
+        return len(self.positives) * self.negatives_per_positive
+    
+    def __getitem__(self, idx):
+        # Get positive sample
+        pos_idx = idx // self.negatives_per_positive
+        user_id, pos_place_id = self.positives[pos_idx]
+        
+        # Sample negative place from same city
+        city_id = self.user_to_city.get(user_id, 0)  # Default to city 0
+        candidate_places = self.city_to_places.get(city_id, list(self.place_id_to_index.keys()))
+        
+        # Exclude positives
+        pos_set = self.user_to_pos_places.get(user_id, set())
+        neg_candidates = [p for p in candidate_places if p not in pos_set]
+        
+        if len(neg_candidates) == 0:
+            # Fallback to any place
+            neg_candidates = [p for p in self.place_id_to_index.keys() if p not in pos_set]
+        
+        neg_place_id = random.choice(neg_candidates)
+        
+        # Convert to graph indices
+        user_idx = self.user_id_to_index[user_id]
+        pos_place_idx = self.place_id_to_index[pos_place_id]
+        neg_place_idx = self.place_id_to_index[neg_place_id]
+        
+        return {
+            'user_idx': user_idx,
+            'pos_place_idx': pos_place_idx,
+            'neg_place_idx': neg_place_idx
+        }
 
-- **Compatibility loss**:
 
-  - Binary cross-entropy on logits:
+class FriendCompatibilityDataset(Dataset):
+    """
+    Dataset for friend compatibility task.
+    """
+    
+    def __init__(
+        self,
+        friend_labels: List[FriendLabelSchema],
+        user_id_to_index: Dict[int, int]
+    ):
+        self.friend_labels = friend_labels
+        self.user_id_to_index = user_id_to_index
+    
+    def __len__(self):
+        return len(self.friend_labels)
+    
+    def __getitem__(self, idx):
+        label = self.friend_labels[idx]
+        
+        user_u_idx = self.user_id_to_index[label.user_u]
+        user_v_idx = self.user_id_to_index[label.user_v]
+        
+        return {
+            'user_u_idx': user_u_idx,
+            'user_v_idx': user_v_idx,
+            'label_compat': label.label_compat,
+            'label_attend': label.label_attend
+        }
+```
 
-  \\[
-  \mathcal{L}_\text{compat} = \text{BCEWithLogits}( s_\text{compat}(u, v), \text{label}_\text{compat} )
-  \\]
+### 5.3 Training Script
 
-- **Attendance loss**:
+**File**: `scripts/run_train_gnn.py`
 
-  - If we simulate or observe acceptance/attendance labels:
+```python
+#!/usr/bin/env python3
+"""
+Main training script for GNN recommendation model.
+"""
 
-  \\[
-  \mathcal{L}_\text{attend} = \text{BCE}( p_\text{attend}(u, v), \text{label}_\text{attend} )
-  \\]
+import torch
+from torch.utils.data import DataLoader
+from recsys.config import ModelConfig
+from recsys.features.graph_builder import load_graph
+from recsys.data.repositories import *
+from recsys.ml.models.encoders import UserEncoder, PlaceEncoder
+from recsys.ml.models.backbone import GraphRecBackbone
+from recsys.ml.models.heads import PlaceHead, FriendHead, ContextEncoder
+from recsys.ml.training.datasets import PlaceRecommendationDataset, FriendCompatibilityDataset
+from recsys.ml.training.train_loop import GNNTrainer
+import argparse
 
-### 5.3 Joint Loss
 
-The total loss combines both tasks (plus regularization):
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--data_dir', type=str, required=True)
+    parser.add_argument('--output_dir', type=str, required=True)
+    parser.add_argument('--epochs', type=int, default=50)
+    parser.add_argument('--device', type=str, default='cuda')
+    args = parser.parse_args()
+    
+    # Load config
+    config = ModelConfig()
+    
+    # Load graph and data
+    print("Loading graph...")
+    graph, user_id_to_index, place_id_to_index, index_to_user_id, index_to_place_id = load_graph(args.data_dir)
+    
+    print("Loading data...")
+    users = list(UserRepository(args.data_dir).get_all_users())
+    places = list(PlaceRepository(args.data_dir).get_all_places())
+    interactions = list(InteractionRepository(args.data_dir).get_all_interactions())
+    friend_labels = list(FriendLabelRepository(args.data_dir).get_all_labels())
+    
+    # Create datasets
+    print("Creating datasets...")
+    place_dataset = PlaceRecommendationDataset(
+        interactions, user_id_to_index, place_id_to_index, places
+    )
+    # Fill user_to_city mapping
+    for user in users:
+        place_dataset.user_to_city[user.user_id] = user.home_city_id
+    
+    friend_dataset = FriendCompatibilityDataset(friend_labels, user_id_to_index)
+    
+    # Data loaders
+    place_loader = DataLoader(place_dataset, batch_size=config.BATCH_SIZE_PLACE, shuffle=True, num_workers=4)
+    friend_loader = DataLoader(friend_dataset, batch_size=config.BATCH_SIZE_FRIEND, shuffle=True, num_workers=4)
+    
+    # Initialize models
+    print("Initializing models...")
+    user_encoder = UserEncoder(config)
+    place_encoder = PlaceEncoder(config)
+    backbone = GraphRecBackbone(config)
+    place_head = PlaceHead(config)
+    friend_head = FriendHead(config)
+    place_ctx_encoder = ContextEncoder(config.D_CTX_PLACE)
+    friend_ctx_encoder = ContextEncoder(config.D_CTX_FRIEND)
+    
+    # Initialize trainer
+    trainer = GNNTrainer(
+        user_encoder, place_encoder, backbone,
+        place_head, friend_head,
+        place_ctx_encoder, friend_ctx_encoder,
+        graph, config, device=args.device
+    )
+    
+    # Training loop
+    print("Starting training...")
+    for epoch in range(args.epochs):
+        losses = trainer.train_epoch(place_loader, friend_loader, epoch)
+        print(f"Epoch {epoch}: {losses}")
+        
+        # Save checkpoint
+        if (epoch + 1) % 10 == 0:
+            trainer.save_checkpoint(f"{args.output_dir}/checkpoint_epoch_{epoch+1}.pt")
+    
+    # Final save
+    trainer.save_checkpoint(f"{args.output_dir}/final_model.pt")
+    print("Training complete!")
 
-\\[
-\mathcal{L}_\text{total}
- = \lambda_\text{place} \, \mathcal{L}_\text{place}
- + \lambda_\text{friend} \, \mathcal{L}_\text{compat}
- + \lambda_\text{attend} \, \mathcal{L}_\text{attend}
- + \text{regularization}
-\\]
 
-where \\(\lambda_\text{place}, \lambda_\text{friend}, \lambda_\text{attend}\\) control the relative importance of each component.
+if __name__ == '__main__':
+    main()
+```
 
 ---
 
-## 6. Inference and Serving Strategy
+## 6. Inference and Serving (FastAPI Implementation)
 
-The trained model is used primarily to produce **embeddings** and train **task heads**:
+### 6.1 Embedding Export Script
 
-- Offline:
-  - Compute **final user embeddings** `z_u` and **place embeddings** `z_p`.
-  - Persist them to storage.
-- Online:
-  - Use **approximate nearest neighbor (ANN)** indices to retrieve candidates.
-  - Re-score candidates with the **task heads** for each request.
+**File**: `scripts/run_export_embeddings.py`
 
-### 6.1 Embedding Export
+```python
+#!/usr/bin/env python3
+"""
+Export trained embeddings to storage for serving.
+"""
 
-After training is complete:
+import torch
+import pandas as pd
+import numpy as np
+import argparse
+from recsys.features.graph_builder import load_graph
+from recsys.ml.models.encoders import UserEncoder, PlaceEncoder
+from recsys.ml.models.backbone import GraphRecBackbone
+from recsys.config.model_config import ModelConfig
 
-1. Run a full forward pass on the graph with the trained model.
-2. Obtain:
-   - `z_user[user_id]` for all users.
-   - `z_place[place_id]` for all places.
-3. Save embeddings to disk (e.g., Parquet/CSV) or database.
-4. Store mappings between internal indices and `user_id`/`place_id`.
 
-### 6.2 ANN Indexes
+def export_embeddings(checkpoint_path: str, data_dir: str, output_dir: str):
+    """
+    Load trained model and export user/place embeddings.
+    """
+    # Load config and graph
+    config = ModelConfig()
+    graph, user_id_to_index, place_id_to_index, index_to_user_id, index_to_place_id = load_graph(data_dir)
+    
+    # Load trained model
+    checkpoint = torch.load(checkpoint_path, map_location='cpu')
+    
+    user_encoder = UserEncoder(config)
+    place_encoder = PlaceEncoder(config)
+    backbone = GraphRecBackbone(config)
+    
+    user_encoder.load_state_dict(checkpoint['user_encoder'])
+    place_encoder.load_state_dict(checkpoint['place_encoder'])
+    backbone.load_state_dict(checkpoint['backbone'])
+    
+    user_encoder.eval()
+    place_encoder.eval()
+    backbone.eval()
+    
+    # Compute embeddings
+    print("Computing embeddings...")
+    with torch.no_grad():
+        # Encode features
+        x_user = user_encoder(graph['user'].x)
+        x_place = place_encoder(graph['place'].x)
+        
+        x_dict = {'user': x_user, 'place': x_place}
+        
+        # GNN forward pass
+        z_dict = backbone(
+            x_dict,
+            graph.edge_index_dict,
+            graph.edge_attr_dict
+        )
+        
+        z_user = z_dict['user'].numpy()  # (N_users, D_MODEL)
+        z_place = z_dict['place'].numpy()  # (N_places, D_MODEL)
+    
+    # Create dataframes with IDs
+    print("Saving embeddings...")
+    
+    # User embeddings
+    user_embeddings = []
+    for idx in range(len(z_user)):
+        user_id = index_to_user_id[idx]
+        embedding = z_user[idx]
+        user_embeddings.append({
+            'user_id': user_id,
+            'embedding': embedding.tolist()
+        })
+    
+    user_df = pd.DataFrame(user_embeddings)
+    user_df.to_parquet(f"{output_dir}/user_embeddings.parquet")
+    
+    # Place embeddings
+    place_embeddings = []
+    for idx in range(len(z_place)):
+        place_id = index_to_place_id[idx]
+        embedding = z_place[idx]
+        place_embeddings.append({
+            'place_id': place_id,
+            'embedding': embedding.tolist()
+        })
+    
+    place_df = pd.DataFrame(place_embeddings)
+    place_df.to_parquet(f"{output_dir}/place_embeddings.parquet")
+    
+    print(f"Exported {len(user_embeddings)} user embeddings")
+    print(f"Exported {len(place_embeddings)} place embeddings")
 
-To achieve **sub-second latency**, build separate ANN indexes:
 
-- **Place index**:
-  - For each city, build an ANN index over all place embeddings belonging to that city.
-  - Metric: typically inner product or cosine similarity.
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--checkpoint', type=str, required=True)
+    parser.add_argument('--data_dir', type=str, required=True)
+    parser.add_argument('--output_dir', type=str, required=True)
+    args = parser.parse_args()
+    
+    export_embeddings(args.checkpoint, args.data_dir, args.output_dir)
+```
 
-- **User index**:
-  - For each city, build an ANN index over user embeddings in that city.
+### 6.2 ANN Index Implementation
 
-These indexes are loaded into memory by the online service.
+**File**: `recsys/serving/ann_index.py`
 
-### 6.3 Online Place Recommendation Flow
+```python
+import faiss
+import numpy as np
+from typing import List, Tuple, Dict
+import pickle
 
-Given a request:
 
-- Inputs:
-  - `user_id`
-  - Optional `city_id` (or derived from user).
-  - Optional context (time slot, mood tags).
+class AnnIndex:
+    """
+    Wrapper around Faiss for ANN search.
+    """
+    
+    def __init__(self, dimension: int, metric: str = 'cosine'):
+        """
+        Args:
+            dimension: Embedding dimension
+            metric: 'cosine' or 'l2'
+        """
+        self.dimension = dimension
+        self.metric = metric
+        self.index = None
+        self.ids = []  # Maps index position -> actual ID
+    
+    def build(self, embeddings: np.ndarray, ids: List[int]):
+        """
+        Build index from embeddings.
+        
+        Args:
+            embeddings: (N, D) array
+            ids: List of N IDs corresponding to embeddings
+        """
+        assert len(embeddings) == len(ids)
+        self.ids = ids
+        
+        # Normalize if cosine
+        if self.metric == 'cosine':
+            faiss.normalize_L2(embeddings)
+            self.index = faiss.IndexFlatIP(self.dimension)  # Inner product
+        else:
+            self.index = faiss.IndexFlatL2(self.dimension)
+        
+        self.index.add(embeddings.astype(np.float32))
+    
+    def search(self, query: np.ndarray, top_k: int) -> List[Tuple[int, float]]:
+        """
+        Search for nearest neighbors.
+        
+        Args:
+            query: (D,) query vector
+            top_k: Number of results
+        
+        Returns:
+            List of (id, distance) tuples
+        """
+        if self.index is None:
+            return []
+        
+        query = query.reshape(1, -1).astype(np.float32)
+        
+        if self.metric == 'cosine':
+            faiss.normalize_L2(query)
+        
+        distances, indices = self.index.search(query, top_k)
+        
+        results = []
+        for idx, dist in zip(indices[0], distances[0]):
+            if idx >= 0 and idx < len(self.ids):
+                results.append((self.ids[idx], float(dist)))
+        
+        return results
+    
+    def save(self, path: str):
+        """Save index to disk."""
+        with open(path, 'wb') as f:
+            pickle.dump({
+                'dimension': self.dimension,
+                'metric': self.metric,
+                'ids': self.ids,
+                'index': faiss.serialize_index(self.index)
+            }, f)
+    
+    def load(self, path: str):
+        """Load index from disk."""
+        with open(path, 'rb') as f:
+            data = pickle.load(f)
+        
+        self.dimension = data['dimension']
+        self.metric = data['metric']
+        self.ids = data['ids']
+        self.index = faiss.deserialize_index(data['index'])
 
-Steps:
 
-1. **Fetch user embedding**:
-   - Look up `z_u` from the embedding store.
-2. **Determine candidate city**:
-   - Use provided `city_id` or user’s home / current city.
-3. **Candidate retrieval**:
-   - Query the **place ANN index** for that city using `z_u`.
-   - Retrieve top \\(M\\) candidates (e.g., \\(M = 200\\)).
-4. **Scoring**:
-   - For each candidate place:
-     - Retrieve `z_p`.
-     - Build context vector `c_ctx`.
-     - Compute `s_place(u, p | ctx)` via the **place head**.
-5. **Ranking and filtering**:
-   - Sort candidates by score.
-   - Apply hard filters (price, category, etc. if requested).
-6. **Explainability**:
-   - For the final top \\(K\\), generate explanation strings (see Section 8).
-7. **Return results**:
-   - Place IDs, scores, and explanations.
+class CityAnnIndexManager:
+    """
+    Manages separate ANN indices per city.
+    """
+    
+    def __init__(self, dimension: int):
+        self.dimension = dimension
+        self.city_indices: Dict[int, AnnIndex] = {}
+    
+    def build_city_index(
+        self,
+        city_id: int,
+        embeddings: np.ndarray,
+        ids: List[int]
+    ):
+        """Build index for a specific city."""
+        index = AnnIndex(self.dimension, metric='cosine')
+        index.build(embeddings, ids)
+        self.city_indices[city_id] = index
+    
+    def search(
+        self,
+        city_id: int,
+        query: np.ndarray,
+        top_k: int
+    ) -> List[Tuple[int, float]]:
+        """Search within a city's index."""
+        if city_id not in self.city_indices:
+            return []
+        return self.city_indices[city_id].search(query, top_k)
+    
+    def save(self, output_dir: str, prefix: str):
+        """Save all city indices."""
+        for city_id, index in self.city_indices.items():
+            index.save(f"{output_dir}/{prefix}_city_{city_id}.idx")
+    
+    def load(self, input_dir: str, prefix: str, city_ids: List[int]):
+        """Load city indices."""
+        for city_id in city_ids:
+            path = f"{input_dir}/{prefix}_city_{city_id}.idx"
+            try:
+                index = AnnIndex(self.dimension)
+                index.load(path)
+                self.city_indices[city_id] = index
+            except FileNotFoundError:
+                print(f"Warning: Index for city {city_id} not found")
+```
 
-### 6.4 Online People Recommendation Flow
+### 6.3 FastAPI Schemas
 
-Given a request:
+**File**: `recsys/serving/api_schemas.py`
 
-- Inputs:
-  - `user_id`.
-  - Optional `city_id`.
-  - Optional `target_place_id` or `activity_tags`.
+```python
+from pydantic import BaseModel
+from typing import List, Optional
 
-Steps:
 
-1. **Fetch query embedding** `z_u`.
-2. **Determine candidate city**.
-3. **Candidate retrieval**:
-   - Query the **user ANN index** for that city using `z_u`.
-   - Exclude self and blocked users.
-4. **Scoring**:
-   - For each candidate user `v`:
-     - Fetch `z_v`.
-     - Build context `c_friend` (including activity/place if provided).
-     - Compute `s_compat(u, v | ctx)` and `p_attend(u, v | ctx)`.
-     - Combine into `s_final`.
-5. **Ranking**:
-   - Sort by `s_final`.
-6. **Explainability**:
-   - Generate explanations for top \\(K\\) matches:
-     - Overlapping tags, similar neighborhoods, etc.
-7. **Return results**:
-   - Candidate user IDs, scores, attendance probability, explanations.
+class PlaceRecommendationRequest(BaseModel):
+    """Request for place recommendations."""
+    user_id: int
+    city_id: Optional[int] = None
+    time_slot: Optional[int] = None  # 0-5
+    desired_categories: Optional[List[int]] = None  # Indices into C_COARSE
+    top_k: int = 10
+
+
+class PlaceRecommendation(BaseModel):
+    """Single place recommendation."""
+    place_id: int
+    score: float
+    explanations: List[str]
+
+
+class PlaceRecommendationResponse(BaseModel):
+    """Response with place recommendations."""
+    recommendations: List[PlaceRecommendation]
+
+
+class PeopleRecommendationRequest(BaseModel):
+    """Request for people recommendations."""
+    user_id: int
+    city_id: Optional[int] = None
+    target_place_id: Optional[int] = None
+    activity_tags: Optional[List[int]] = None
+    top_k: int = 10
+
+
+class PeopleRecommendation(BaseModel):
+    """Single person recommendation."""
+    user_id: int
+    compat_score: float
+    attend_prob: float
+    combined_score: float
+    explanations: List[str]
+
+
+class PeopleRecommendationResponse(BaseModel):
+    """Response with people recommendations."""
+    recommendations: List[PeopleRecommendation]
+```
+
+### 6.4 Recommender Core (Business Logic)
+
+**File**: `recsys/serving/recommender_core.py`
+
+```python
+import torch
+import numpy as np
+from typing import List, Dict, Tuple
+from recsys.serving.ann_index import CityAnnIndexManager
+from recsys.data.schemas import UserSchema, PlaceSchema
+from recsys.ml.models.heads import PlaceHead, FriendHead, ContextEncoder
+from recsys.config.model_config import ModelConfig
+
+
+class EmbeddingStore:
+    """
+    In-memory storage for embeddings.
+    """
+    
+    def __init__(self):
+        self.user_embeddings: Dict[int, np.ndarray] = {}
+        self.place_embeddings: Dict[int, np.ndarray] = {}
+    
+    def load_from_parquet(self, user_path: str, place_path: str):
+        """Load embeddings from parquet files."""
+        import pandas as pd
+        
+        user_df = pd.read_parquet(user_path)
+        for _, row in user_df.iterrows():
+            self.user_embeddings[row['user_id']] = np.array(row['embedding'])
+        
+        place_df = pd.read_parquet(place_path)
+        for _, row in place_df.iterrows():
+            self.place_embeddings[row['place_id']] = np.array(row['embedding'])
+    
+    def get_user_embedding(self, user_id: int) -> np.ndarray:
+        return self.user_embeddings.get(user_id)
+    
+    def get_place_embedding(self, place_id: int) -> np.ndarray:
+        return self.place_embeddings.get(place_id)
+
+
+class PlaceRecommender:
+    """
+    Core logic for place recommendations.
+    """
+    
+    def __init__(
+        self,
+        embedding_store: EmbeddingStore,
+        place_ann_manager: CityAnnIndexManager,
+        place_head: PlaceHead,
+        ctx_encoder: ContextEncoder,
+        user_repo,
+        place_repo,
+        explanation_service,
+        config: ModelConfig
+    ):
+        self.embedding_store = embedding_store
+        self.place_ann = place_ann_manager
+        self.place_head = place_head
+        self.ctx_encoder = ctx_encoder
+        self.user_repo = user_repo
+        self.place_repo = place_repo
+        self.explanation_service = explanation_service
+        self.config = config
+        
+        self.place_head.eval()
+    
+    def recommend(
+        self,
+        user_id: int,
+        city_id: Optional[int] = None,
+        time_slot: Optional[int] = None,
+        desired_categories: Optional[List[int]] = None,
+        top_k: int = 10,
+        top_m_candidates: int = 200
+    ) -> List[Dict]:
+        """
+        Generate place recommendations.
+        
+        Returns:
+            List of dicts with place_id, score, explanations
+        """
+        # 1. Get user embedding
+        z_u = self.embedding_store.get_user_embedding(user_id)
+        if z_u is None:
+            return []
+        
+        # 2. Determine city
+        if city_id is None:
+            user = self.user_repo.get_user(user_id)
+            city_id = user.home_city_id
+        
+        # 3. ANN candidate retrieval
+        candidates = self.place_ann.search(city_id, z_u, top_m_candidates)
+        if not candidates:
+            return []
+        
+        # 4. Prepare context
+        if time_slot is None:
+            time_slot = 3  # Default: evening
+        
+        if desired_categories is None:
+            desired_categories = [0.0] * 6
+        else:
+            # Convert to multi-hot
+            cat_vec = [0.0] * 6
+            for cat_idx in desired_categories:
+                if 0 <= cat_idx < 6:
+                    cat_vec[cat_idx] = 1.0
+            desired_categories = cat_vec
+        
+        # 5. Score with head
+        scored_candidates = []
+        
+        with torch.no_grad():
+            z_u_torch = torch.tensor(z_u, dtype=torch.float32).unsqueeze(0)
+            
+            for place_id, ann_score in candidates:
+                z_p = self.embedding_store.get_place_embedding(place_id)
+                if z_p is None:
+                    continue
+                
+                z_p_torch = torch.tensor(z_p, dtype=torch.float32).unsqueeze(0)
+                
+                # Build context
+                city_tensor = torch.tensor([city_id], dtype=torch.long)
+                time_tensor = torch.tensor([time_slot], dtype=torch.long)
+                cat_tensor = torch.tensor([desired_categories], dtype=torch.float32)
+                
+                ctx = self.ctx_encoder(city_tensor, time_tensor, cat_tensor)
+                
+                # Score
+                score = self.place_head(z_u_torch, z_p_torch, ctx).item()
+                
+                scored_candidates.append((place_id, score))
+        
+        # 6. Sort and top-K
+        scored_candidates.sort(key=lambda x: -x[1])
+        top_candidates = scored_candidates[:top_k]
+        
+        # 7. Generate explanations
+        results = []
+        user = self.user_repo.get_user(user_id)
+        
+        for place_id, score in top_candidates:
+            place = self.place_repo.get_place(place_id)
+            explanations = self.explanation_service.explain_place(user, place)
+            
+            results.append({
+                'place_id': place_id,
+                'score': score,
+                'explanations': explanations
+            })
+        
+        return results
+
+
+class PeopleRecommender:
+    """
+    Core logic for people recommendations.
+    """
+    
+    def __init__(
+        self,
+        embedding_store: EmbeddingStore,
+        user_ann_manager: CityAnnIndexManager,
+        friend_head: FriendHead,
+        ctx_encoder: ContextEncoder,
+        user_repo,
+        explanation_service,
+        config: ModelConfig
+    ):
+        self.embedding_store = embedding_store
+        self.user_ann = user_ann_manager
+        self.friend_head = friend_head
+        self.ctx_encoder = ctx_encoder
+        self.user_repo = user_repo
+        self.explanation_service = explanation_service
+        self.config = config
+        
+        self.friend_head.eval()
+    
+    def recommend(
+        self,
+        user_id: int,
+        city_id: Optional[int] = None,
+        target_place_id: Optional[int] = None,
+        activity_tags: Optional[List[int]] = None,
+        top_k: int = 10,
+        top_m_candidates: int = 200,
+        alpha: float = 0.7
+    ) -> List[Dict]:
+        """
+        Generate people recommendations.
+        
+        Returns:
+            List of dicts with user_id, compat_score, attend_prob, combined_score, explanations
+        """
+        # 1. Get query user embedding
+        z_u = self.embedding_store.get_user_embedding(user_id)
+        if z_u is None:
+            return []
+        
+        # 2. Determine city
+        if city_id is None:
+            user = self.user_repo.get_user(user_id)
+            city_id = user.home_city_id
+        
+        # 3. ANN retrieval
+        candidates = self.user_ann.search(city_id, z_u, top_m_candidates)
+        # Filter out self
+        candidates = [(uid, score) for uid, score in candidates if uid != user_id]
+        
+        if not candidates:
+            return []
+        
+        # 4. Prepare context (dummy for now)
+        # Can be enhanced with target_place_id and activity_tags
+        
+        # 5. Score with friend head
+        scored_candidates = []
+        
+        with torch.no_grad():
+            z_u_torch = torch.tensor(z_u, dtype=torch.float32).unsqueeze(0)
+            
+            for candidate_uid, ann_score in candidates:
+                z_v = self.embedding_store.get_user_embedding(candidate_uid)
+                if z_v is None:
+                    continue
+                
+                z_v_torch = torch.tensor(z_v, dtype=torch.float32).unsqueeze(0)
+                
+                # Dummy context
+                ctx = torch.zeros(1, self.config.D_CTX_FRIEND)
+                
+                # Score
+                compat_logit, attend_prob = self.friend_head(z_u_torch, z_v_torch, ctx)
+                
+                compat_score = torch.sigmoid(compat_logit).item()
+                attend_prob = attend_prob.item()
+                
+                combined_score = alpha * compat_score + (1 - alpha) * attend_prob
+                
+                scored_candidates.append((
+                    candidate_uid, compat_score, attend_prob, combined_score
+                ))
+        
+        # 6. Sort and top-K
+        scored_candidates.sort(key=lambda x: -x[3])
+        top_candidates = scored_candidates[:top_k]
+        
+        # 7. Generate explanations
+        results = []
+        query_user = self.user_repo.get_user(user_id)
+        
+        for candidate_uid, compat_score, attend_prob, combined_score in top_candidates:
+            candidate_user = self.user_repo.get_user(candidate_uid)
+            explanations = self.explanation_service.explain_people(query_user, candidate_user)
+            
+            results.append({
+                'user_id': candidate_uid,
+                'compat_score': compat_score,
+                'attend_prob': attend_prob,
+                'combined_score': combined_score,
+                'explanations': explanations
+            })
+        
+        return results
+```
+
+### 6.5 Explanation Service
+
+**File**: `recsys/serving/explanations.py`
+
+```python
+from typing import List
+from recsys.data.schemas import UserSchema, PlaceSchema
+from recsys.config.constants import FINE_TAGS, COARSE_CATEGORIES, VIBE_TAGS
+import numpy as np
+
+
+class ExplanationService:
+    """
+    Generates human-readable explanations for recommendations.
+    """
+    
+    def explain_place(
+        self,
+        user: UserSchema,
+        place: PlaceSchema,
+        top_k_tags: int = 2
+    ) -> List[str]:
+        """
+        Generate explanations for why a place was recommended to a user.
+        
+        Args:
+            user: UserSchema
+            place: PlaceSchema
+            top_k_tags: Number of tag overlaps to mention
+        
+        Returns:
+            List of explanation strings
+        """
+        explanations = []
+        
+        # 1. Find overlapping fine tags
+        user_fine = np.array(user.fine_pref)
+        place_fine = np.array(place.fine_tag_vector)
+        
+        # Element-wise product to find mutual high-weight tags
+        overlap_scores = user_fine * place_fine
+        top_indices = np.argsort(-overlap_scores)[:top_k_tags]
+        
+        top_tags = [FINE_TAGS[idx] for idx in top_indices if overlap_scores[idx] > 0.01]
+        
+        if len(top_tags) >= 2:
+            explanations.append(
+                f"Matches your interest in {top_tags[0]} and {top_tags[1]}."
+            )
+        elif len(top_tags) == 1:
+            explanations.append(
+                f"Matches your interest in {top_tags[0]}."
+            )
+        
+        # 2. Check coarse category alignment
+        user_cat = np.array(user.cat_pref)
+        place_cat = np.array(place.category_one_hot)
+        
+        top_cat_idx = np.argmax(user_cat * place_cat)
+        if user_cat[top_cat_idx] > 0.15 and place_cat[top_cat_idx] > 0:
+            category_name = COARSE_CATEGORIES[top_cat_idx]
+            explanations.append(
+                f"You enjoy {category_name} spots."
+            )
+        
+        # 3. Check neighborhood proximity
+        if place.neighborhood_id in user.area_freqs:
+            explanations.append(
+                f"You often go out in this neighborhood."
+            )
+        
+        # If no strong explanations, add a generic one
+        if not explanations:
+            explanations.append("Recommended based on your activity history.")
+        
+        return explanations[:3]  # Max 3 explanations
+    
+    def explain_people(
+        self,
+        user_u: UserSchema,
+        user_v: UserSchema,
+        top_k_tags: int = 2
+    ) -> List[str]:
+        """
+        Generate explanations for why two users are compatible.
+        
+        Args:
+            user_u: Query user
+            user_v: Candidate user
+            top_k_tags: Number of overlaps to mention
+        
+        Returns:
+            List of explanation strings
+        """
+        explanations = []
+        
+        # 1. Find overlapping vibe/personality tags
+        vibe_u = np.array(user_u.vibe_pref)
+        vibe_v = np.array(user_v.vibe_pref)
+        
+        vibe_overlap = vibe_u * vibe_v
+        top_vibe_indices = np.argsort(-vibe_overlap)[:top_k_tags]
+        
+        top_vibe_tags = [
+            VIBE_TAGS[idx] for idx in top_vibe_indices
+            if vibe_overlap[idx] > 0.01
+        ]
+        
+        if len(top_vibe_tags) >= 2:
+            explanations.append(
+                f"You both are {top_vibe_tags[0]} and {top_vibe_tags[1]}."
+            )
+        elif len(top_vibe_tags) == 1:
+            explanations.append(
+                f"You both are {top_vibe_tags[0]}."
+            )
+        
+        # 2. Find overlapping fine interests
+        fine_u = np.array(user_u.fine_pref)
+        fine_v = np.array(user_v.fine_pref)
+        
+        fine_overlap = fine_u * fine_v
+        top_fine_indices = np.argsort(-fine_overlap)[:top_k_tags]
+        
+        top_fine_tags = [
+            FINE_TAGS[idx] for idx in top_fine_indices
+            if fine_overlap[idx] > 0.01
+        ]
+        
+        if len(top_fine_tags) >= 2:
+            explanations.append(
+                f"You both like {top_fine_tags[0]} and {top_fine_tags[1]}."
+            )
+        elif len(top_fine_tags) == 1:
+            explanations.append(
+                f"You both like {top_fine_tags[0]}."
+            )
+        
+        # 3. Check shared neighborhoods
+        shared_neighborhoods = set(user_u.area_freqs.keys()) & set(user_v.area_freqs.keys())
+        if shared_neighborhoods:
+            explanations.append(
+                "You both often go out in the same neighborhoods."
+            )
+        
+        # Fallback
+        if not explanations:
+            explanations.append("You have similar interests and activity patterns.")
+        
+        return explanations[:3]
+```
+
+### 6.6 FastAPI Application
+
+**File**: `recsys/serving/api_main.py`
+
+```python
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+import torch
+import uvicorn
+
+from recsys.serving.api_schemas import *
+from recsys.serving.recommender_core import PlaceRecommender, PeopleRecommender, EmbeddingStore
+from recsys.serving.ann_index import CityAnnIndexManager
+from recsys.serving.explanations import ExplanationService
+from recsys.ml.models.heads import PlaceHead, FriendHead, ContextEncoder
+from recsys.data.repositories import UserRepository, PlaceRepository
+from recsys.config.model_config import ModelConfig
+from recsys.config.constants import N_CITIES
+
+# Initialize FastAPI app
+app = FastAPI(
+    title="Social Outing Recommender API",
+    description="GNN-powered place and people recommendations",
+    version="1.0.0"
+)
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Global state (initialized on startup)
+place_recommender = None
+people_recommender = None
+
+
+@app.on_event("startup")
+async def startup_event():
+    """
+    Load models, embeddings, and indices on startup.
+    """
+    global place_recommender, people_recommender
+    
+    print("Loading configuration...")
+    config = ModelConfig()
+    
+    # Load embeddings
+    print("Loading embeddings...")
+    embedding_store = EmbeddingStore()
+    embedding_store.load_from_parquet(
+        user_path="data/embeddings/user_embeddings.parquet",
+        place_path="data/embeddings/place_embeddings.parquet"
+    )
+    
+    # Load ANN indices
+    print("Loading ANN indices...")
+    place_ann = CityAnnIndexManager(dimension=config.D_MODEL)
+    user_ann = CityAnnIndexManager(dimension=config.D_MODEL)
+    
+    city_ids = list(range(N_CITIES))
+    place_ann.load("data/indices", "place", city_ids)
+    user_ann.load("data/indices", "user", city_ids)
+    
+    # Load trained model heads
+    print("Loading model heads...")
+    checkpoint = torch.load("data/models/final_model.pt", map_location='cpu')
+    
+    place_head = PlaceHead(config)
+    friend_head = FriendHead(config)
+    place_ctx_encoder = ContextEncoder(config.D_CTX_PLACE)
+    friend_ctx_encoder = ContextEncoder(config.D_CTX_FRIEND)
+    
+    place_head.load_state_dict(checkpoint['place_head'])
+    friend_head.load_state_dict(checkpoint['friend_head'])
+    place_ctx_encoder.load_state_dict(checkpoint['place_ctx_encoder'])
+    friend_ctx_encoder.load_state_dict(checkpoint['friend_ctx_encoder'])
+    
+    place_head.eval()
+    friend_head.eval()
+    
+    # Initialize repositories
+    user_repo = UserRepository("data")
+    place_repo = PlaceRepository("data")
+    
+    # Initialize explanation service
+    explanation_service = ExplanationService()
+    
+    # Initialize recommenders
+    place_recommender = PlaceRecommender(
+        embedding_store=embedding_store,
+        place_ann_manager=place_ann,
+        place_head=place_head,
+        ctx_encoder=place_ctx_encoder,
+        user_repo=user_repo,
+        place_repo=place_repo,
+        explanation_service=explanation_service,
+        config=config
+    )
+    
+    people_recommender = PeopleRecommender(
+        embedding_store=embedding_store,
+        user_ann_manager=user_ann,
+        friend_head=friend_head,
+        ctx_encoder=friend_ctx_encoder,
+        user_repo=user_repo,
+        explanation_service=explanation_service,
+        config=config
+    )
+    
+    print("Server ready!")
+
+
+@app.get("/")
+async def root():
+    return {"message": "Social Outing Recommender API", "status": "online"}
+
+
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
+
+
+@app.post("/recommend/places", response_model=PlaceRecommendationResponse)
+async def recommend_places(request: PlaceRecommendationRequest):
+    """
+    Get place recommendations for a user.
+    
+    Example request:
+    ```
+    {
+      "user_id": 42,
+      "city_id": 2,
+      "time_slot": 3,
+      "desired_categories": [0, 2],
+      "top_k": 10
+    }
+    ```
+    """
+    try:
+        results = place_recommender.recommend(
+            user_id=request.user_id,
+            city_id=request.city_id,
+            time_slot=request.time_slot,
+            desired_categories=request.desired_categories,
+            top_k=request.top_k
+        )
+        
+        recommendations = [
+            PlaceRecommendation(**result) for result in results
+        ]
+        
+        return PlaceRecommendationResponse(recommendations=recommendations)
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/recommend/people", response_model=PeopleRecommendationResponse)
+async def recommend_people(request: PeopleRecommendationRequest):
+    """
+    Get people recommendations for a user.
+    
+    Example request:
+    ```
+    {
+      "user_id": 42,
+      "city_id": 2,
+      "target_place_id": 1234,
+      "top_k": 10
+    }
+    ```
+    """
+    try:
+        results = people_recommender.recommend(
+            user_id=request.user_id,
+            city_id=request.city_id,
+            target_place_id=request.target_place_id,
+            activity_tags=request.activity_tags,
+            top_k=request.top_k
+        )
+        
+        recommendations = [
+            PeopleRecommendation(**result) for result in results
+        ]
+        
+        return PeopleRecommendationResponse(recommendations=recommendations)
+    
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+if __name__ == "__main__":
+    uvicorn.run(
+        "api_main:app",
+        host="0.0.0.0",
+        port=8000,
+        reload=False
+    )
+```
+
+**Run script**: `scripts/run_api_server.sh`
+
+```bash
+#!/bin/bash
+# Start the FastAPI server
+
+python -m uvicorn recsys.serving.api_main:app \
+    --host 0.0.0.0 \
+    --port 8000 \
+    --workers 4
+```
+
+**Example API Usage**:
+
+```python
+import requests
+
+# Place recommendations
+response = requests.post(
+    "http://localhost:8000/recommend/places",
+    json={
+        "user_id": 42,
+        "city_id": 2,
+        "time_slot": 3,  # evening
+        "desired_categories": [0, 2],  # entertainment + clubs
+        "top_k": 10
+    }
+)
+places = response.json()["recommendations"]
+
+# People recommendations
+response = requests.post(
+    "http://localhost:8000/recommend/people",
+    json={
+        "user_id": 42,
+        "city_id": 2,
+        "top_k": 10
+    }
+)
+people = response.json()["recommendations"]
+```
 
 ---
 
-## 7. Synthetic Data Generation Plan
+## 7. Synthetic Data Generation (Complete Python Implementation)
 
 The goal is to generate a **synthetic but realistic world** that:
 
@@ -1403,156 +2676,1032 @@ The goal is to generate a **synthetic but realistic world** that:
   - **Place recommendation**.
   - **Friend / people compatibility**.
 
-### 7.1 Global Configuration
+### 7.1 Generator Configuration
 
-- **Counts**:
-  - `N_users = 10_000`.
-  - `N_places = 10_000`.
-  - `N_cities` ≈ 5–10.
-  - Neighborhoods per city: 10–20.
-- **Tags**:
-  - `C_coarse` ≈ 5–8 coarse categories.
-  - `C_fine` ≈ 100 fine tags.
-  - `C_vibe` ≈ 30 vibe/personality tags.
+**File**: `recsys/synthetic/generator_config.py`
 
-### 7.2 Synthetic Places
+```python
+"""
+Configuration for synthetic data generation.
+"""
 
-For each place:
+from dataclasses import dataclass
+from typing import List, Dict
+import numpy as np
 
-1. **Location**:
-   - Sample `city_id` using a skewed distribution (some cities larger).
-   - Sample `neighborhood_id` uniformly or from city-specific distribution.
-2. **Categories**:
-   - Sample 1–2 coarse categories.
-   - Construct `category_one_hot` (possibly multi-hot).
-3. **Fine tags**:
-   - For each coarse category, define a subset of consistent fine tags (e.g., sports → bouldering, badminton).
-   - Sample 3–7 fine tags and assign random weights.
-   - Normalize to get `fine_tag_vector`.
-4. **Operational attributes**:
-   - `price_band` sampled from a city-specific distribution.
-   - `typical_time_slot` sampled from a categorical distribution (e.g., nightlife vs brunch).
-5. **Popularity**:
-   - Sample `base_popularity` from a log-normal distribution.
-   - Derive `avg_daily_visits`, `conversion_rate`, `novelty_score` from `base_popularity` with noise.
+@dataclass
+class SyntheticConfig:
+    """Configuration for synthetic data generation."""
+    
+    # Scale
+    N_USERS: int = 10_000
+    N_PLACES: int = 10_000
+    N_CITIES: int = 8
+    N_NEIGHBORHOODS_PER_CITY: int = 15
+    
+    # Taxonomy dimensions (must match constants.py)
+    C_COARSE: int = 6
+    C_FINE: int = 100
+    C_VIBE: int = 30
+    
+    # Category-to-tag mapping (which fine tags belong to which coarse categories)
+    CATEGORY_TO_TAGS: Dict[int, List[int]] = None
+    
+    # Distribution parameters
+    DIRICHLET_ALPHA_CAT: float = 2.0  # For category preferences
+    DIRICHLET_ALPHA_FINE: float = 1.0  # For fine-tag preferences
+    DIRICHLET_ALPHA_VIBE: float = 1.5  # For vibe preferences
+    DIRICHLET_ALPHA_AREA: float = 3.0  # For area frequencies
+    
+    # City distribution (weights for sampling cities, sums to 1.0)
+    CITY_WEIGHTS: List[float] = None
+    
+    # User behavior ranges
+    SESSIONS_PER_WEEK_RANGE: tuple = (1.0, 8.0)
+    VIEWS_PER_SESSION_RANGE: tuple = (10.0, 80.0)
+    LIKES_PER_SESSION_RANGE: tuple = (0.5, 5.0)
+    SAVES_PER_SESSION_RANGE: tuple = (0.2, 3.0)
+    ATTENDS_PER_MONTH_RANGE: tuple = (1.0, 12.0)
+    
+    # Interaction parameters
+    TIME_HORIZON_WEEKS: int = 12  # Simulate 12 weeks of data
+    INTERACTIONS_PER_USER_RANGE: tuple = (50, 500)
+    
+    # Preference scoring weights
+    W_INTEREST: float = 0.4
+    W_CATEGORY: float = 0.3
+    W_LOCATION: float = 0.2
+    W_POPULARITY: float = 0.1
+    
+    # Social edge parameters
+    SIMILARITY_THRESHOLD: float = 0.3  # Min cosine similarity for social edge
+    K_SIMILAR_USERS: int = 50  # Find top-K similar users per user
+    CO_ATTENDANCE_PROB: float = 0.1  # Probability of co-attendance for similar pairs
+    
+    # Random seed for reproducibility
+    RANDOM_SEED: int = 42
+    
+    def __post_init__(self):
+        """Initialize derived parameters."""
+        if self.CITY_WEIGHTS is None:
+            # Skewed distribution: some cities larger than others
+            weights = np.random.dirichlet([2.0] * self.N_CITIES)
+            self.CITY_WEIGHTS = weights.tolist()
+        
+        if self.CATEGORY_TO_TAGS is None:
+            # Define which fine tags belong to which coarse categories
+            tags_per_category = self.C_FINE // self.C_COARSE
+            self.CATEGORY_TO_TAGS = {}
+            for cat_idx in range(self.C_COARSE):
+                start = cat_idx * tags_per_category
+                end = start + tags_per_category
+                if cat_idx == self.C_COARSE - 1:  # Last category gets remaining tags
+                    end = self.C_FINE
+                self.CATEGORY_TO_TAGS[cat_idx] = list(range(start, end))
 
-### 7.3 Synthetic Users
 
-For each user:
+def get_default_config() -> SyntheticConfig:
+    """Get default configuration."""
+    return SyntheticConfig()
+```
 
-1. **Home location**:
-   - Sample `home_city_id` with more users assigned to larger cities.
-   - Sample `home_neighborhood_id` within that city.
-2. **Interest over coarse categories**:
-   - Sample `user_cat_pref ~ Dirichlet(alpha_cat)` (hyperparameters tuned to produce diverse but focused users).
-3. **Fine-tag interest**:
-   - For each category where user has higher weight, bias fine-tag probabilities towards tags associated with that category.
-   - Sample `user_fine_pref ~ Dirichlet(alpha_fine_conditional)` and normalize.
-4. **Vibe / personality profile**:
-   - Choose 3–10 vibe tags as “core traits” for the user.
-   - Assign random positive weights and normalize into `user_vibe_pref`.
-5. **Behavior statistics**:
-   - Sample:
-     - `avg_sessions_per_week` from a small range (e.g., 1–10).
-     - `avg_views_per_session` (e.g., 10–100).
-     - `avg_likes_per_session`, `avg_saves_per_session`, `avg_attends_per_month`.
-6. **Location behavior**:
-   - Concentrate activity on 1–3 neighborhoods:
-     - Sample a neighborhood subset.
-     - Draw a Dirichlet over them for `area_freqs`.
+### 7.2 Place Generation
 
-### 7.4 Synthetic User–Place Interactions
+**File**: `recsys/synthetic/generate_places.py`
 
-We model interactions to be **consistent with**:
+```python
+"""
+Generate synthetic places.
+"""
 
-- User category and fine-tag preferences.
-- User location behavior.
-- Place categories, fine tags, and popularity.
+import numpy as np
+from typing import List
+from recsys.data.schemas import PlaceSchema
+from recsys.synthetic.generator_config import SyntheticConfig
 
-For each user:
 
-1. **Total interactions**:
-   - Approximate `N_interactions` per user:
-     - `N_interactions ≈ avg_sessions_per_week * time_horizon_weeks * views_per_session`.
-     - Use a cap (e.g., 100–1000 per user).
-2. **Candidate places**:
-   - Start with places in the same city.
-   - Occasionally include places in nearby or other cities to simulate travel.
-3. **Preference score** for each candidate place `p`:
-   - Compute:
-     - **Interest similarity**:
-       - `sim_interest = cosine(user_fine_pref, place_fine_tags)`.
-     - **Category alignment**:
-       - `sim_cat = dot(user_cat_pref, place_category_one_hot)`.
-     - **Location factor**:
-       - Higher for same neighborhood or frequent areas.
-     - **Popularity factor**:
-       - Derived from `base_popularity`.
-   - Combine:
+def generate_place(place_id: int, config: SyntheticConfig, rng: np.random.Generator) -> PlaceSchema:
+    """
+    Generate a single synthetic place.
+    
+    Args:
+        place_id: Place ID (0 to N_PLACES-1)
+        config: Generator configuration
+        rng: Random number generator
+    
+    Returns:
+        PlaceSchema
+    """
+    # 1. Location
+    city_id = rng.choice(config.N_CITIES, p=config.CITY_WEIGHTS)
+    neighborhood_id = rng.integers(0, config.N_NEIGHBORHOODS_PER_CITY)
+    
+    # 2. Categories (sample 1-2 coarse categories)
+    num_categories = rng.choice([1, 2], p=[0.7, 0.3])  # 70% single category
+    category_ids = rng.choice(
+        config.C_COARSE,
+        size=num_categories,
+        replace=False
+    ).tolist()
+    
+    # Create multi-hot encoding
+    category_one_hot = [0.0] * config.C_COARSE
+    for cat_id in category_ids:
+        category_one_hot[cat_id] = 1.0 / num_categories  # Equal weight if multi-category
+    
+    # 3. Fine tags (sample from tags associated with selected categories)
+    candidate_tags = []
+    for cat_id in category_ids:
+        candidate_tags.extend(config.CATEGORY_TO_TAGS[cat_id])
+    
+    # Sample 3-7 fine tags
+    num_tags = rng.integers(3, 8)
+    if len(candidate_tags) < num_tags:
+        # If not enough candidate tags, add random tags
+        other_tags = [t for t in range(config.C_FINE) if t not in candidate_tags]
+        candidate_tags.extend(rng.choice(other_tags, size=num_tags - len(candidate_tags), replace=False))
+    
+    selected_tags = rng.choice(candidate_tags, size=min(num_tags, len(candidate_tags)), replace=False)
+    
+    # Assign weights and normalize
+    tag_weights = rng.exponential(scale=1.0, size=len(selected_tags))
+    fine_tag_vector = np.zeros(config.C_FINE)
+    fine_tag_vector[selected_tags] = tag_weights
+    fine_tag_vector = fine_tag_vector / fine_tag_vector.sum()  # Normalize
+    
+    # 4. Operational attributes
+    # Price band: higher in certain cities (simulate expensive cities)
+    expensive_cities = [0, 1]  # First two cities are expensive
+    if city_id in expensive_cities:
+        price_band = rng.choice([2, 3, 4], p=[0.3, 0.5, 0.2])
+    else:
+        price_band = rng.choice([0, 1, 2, 3], p=[0.3, 0.4, 0.2, 0.1])
+    
+    # Typical time slot (0-5)
+    typical_time_slot = rng.integers(0, 6)
+    
+    # 5. Popularity (log-normal distribution)
+    base_popularity = float(rng.lognormal(mean=1.0, sigma=1.0))
+    
+    # Derive related metrics with noise
+    avg_daily_visits = base_popularity * rng.uniform(0.8, 1.2) * 10
+    conversion_rate = min(0.95, max(0.05, rng.beta(2, 5) * (base_popularity / 10)))
+    novelty_score = 1.0 / (1.0 + np.log1p(base_popularity))
+    
+    return PlaceSchema(
+        place_id=place_id,
+        city_id=int(city_id),
+        neighborhood_id=int(neighborhood_id),
+        category_ids=category_ids,
+        category_one_hot=category_one_hot,
+        fine_tag_vector=fine_tag_vector.tolist(),
+        price_band=int(price_band),
+        typical_time_slot=int(typical_time_slot),
+        base_popularity=float(base_popularity),
+        avg_daily_visits=float(avg_daily_visits),
+        conversion_rate=float(conversion_rate),
+        novelty_score=float(novelty_score)
+    )
 
-     \\[
-     \text{score}_{up} = w_1 \cdot \text{sim}_\text{interest}
-       + w_2 \cdot \text{sim}_\text{cat}
-       + w_3 \cdot \text{loc\_factor}
-       + w_4 \cdot \text{popularity}
-       + \text{noise}
-     \\]
 
-4. **Sampling interactions**:
-   - Convert scores to probabilities using softmax over candidate places.
-   - Sample places according to these probabilities until `N_interactions` is reached.
-5. **Event details per interaction**:
-   - For each sampled `(u, p)`:
-     - **Dwell time**:
-       - Sample from a distribution increasing in `score_up`.
-     - **Actions**:
-       - With higher `score_up`, increase probability of like/save/attend.
-       - Example:
-         - Low score: view-only.
-         - Medium: view + like.
-         - High: view + like + save, and sometimes attend.
-     - **Implicit rating**:
-       - Map (dwell, like/save, attend) to rating in [1, 5] with added noise.
-     - **Timestamp**:
-       - Sample a datetime in a chosen time horizon.
-       - Derive `time_of_day_bucket`, `day_of_week_bucket` from timestamp.
+def generate_all_places(config: SyntheticConfig) -> List[PlaceSchema]:
+    """
+    Generate all synthetic places.
+    
+    Args:
+        config: Generator configuration
+    
+    Returns:
+        List of PlaceSchema
+    """
+    rng = np.random.default_rng(config.RANDOM_SEED)
+    
+    places = []
+    print(f"Generating {config.N_PLACES} places...")
+    
+    for place_id in range(config.N_PLACES):
+        if (place_id + 1) % 1000 == 0:
+            print(f"  Generated {place_id + 1}/{config.N_PLACES} places")
+        
+        place = generate_place(place_id, config, rng)
+        places.append(place)
+    
+    print(f"✅ Generated {len(places)} places")
+    return places
+```
 
-### 7.5 Synthetic User–User Edges and Friend Labels
+### 7.3 User Generation
 
-We need:
+**File**: `recsys/synthetic/generate_users.py`
 
-- A graph of soft social edges.
-- Labels for training the friend compatibility and attendance heads.
+```python
+"""
+Generate synthetic users.
+"""
 
-Steps:
+import numpy as np
+from typing import List, Dict
+from recsys.data.schemas import UserSchema
+from recsys.synthetic.generator_config import SyntheticConfig
 
-1. **Interest similarity pre-graph**:
-   - Use user fine-tag vectors (`user_fine_pref`) and possibly vibe vectors.
-   - For each user:
-     - Find top-k similar users via cosine similarity (ANN can be used even here).
-   - Candidate social edges: pairs with similarity above a threshold.
-2. **Co-attendance simulation**:
-   - For some high-similarity pairs in the same city:
-     - Simulate joint outings:
-       - Choose a place where both have high `score_up`.
-       - Mark as “co-attended”.
-   - Maintain `co_attendance_count` for each pair.
-3. **Social edge construction**:
-   - For each candidate pair `(u, v)`:
-     - Compute:
-       - `interest_overlap_score` (cosine).
-       - `co_attendance_count`.
-       - `same_neighborhood_freq` (based on `area_freqs`).
-   - Keep edges where the combined score exceeds a threshold.
-4. **Friend labels**:
-   - **Positive labels** for compatibility:
-     - Pairs with high `interest_overlap_score` and/or `co_attendance_count`.
-   - **Negative labels**:
-     - Randomly sampled same-city pairs with low overlap and no co-attendance.
-   - **Attendance labels** for the friend head:
-     - For some positive pairs, simulate acceptance/attendance behavior:
-       - Higher probability of accept/attend when similarity and co-attendance are high.
-     - Record `label_attend` (0/1).
+
+def generate_user(user_id: int, config: SyntheticConfig, rng: np.random.Generator) -> UserSchema:
+    """
+    Generate a single synthetic user.
+    
+    Args:
+        user_id: User ID (0 to N_USERS-1)
+        config: Generator configuration
+        rng: Random number generator
+    
+    Returns:
+        UserSchema
+    """
+    # 1. Home location (sample city according to weights)
+    home_city_id = rng.choice(config.N_CITIES, p=config.CITY_WEIGHTS)
+    home_neighborhood_id = rng.integers(0, config.N_NEIGHBORHOODS_PER_CITY)
+    
+    # 2. Interest over coarse categories (Dirichlet for diversity)
+    cat_pref_raw = rng.dirichlet([config.DIRICHLET_ALPHA_CAT] * config.C_COARSE)
+    cat_pref = cat_pref_raw / cat_pref_raw.sum()  # Ensure normalization
+    
+    # 3. Fine-tag interest (bias towards tags in preferred categories)
+    # Build biased alpha for fine tags
+    alpha_fine = np.ones(config.C_FINE) * 0.1  # Base small value
+    
+    # Boost tags in preferred categories
+    for cat_idx, cat_weight in enumerate(cat_pref):
+        if cat_weight > 0.1:  # Only boost significant categories
+            for tag_idx in config.CATEGORY_TO_TAGS[cat_idx]:
+                alpha_fine[tag_idx] += cat_weight * config.DIRICHLET_ALPHA_FINE * 5
+    
+    fine_pref_raw = rng.dirichlet(alpha_fine)
+    fine_pref = fine_pref_raw / fine_pref_raw.sum()
+    
+    # 4. Vibe / personality profile (choose 3-10 core traits)
+    num_vibe_tags = rng.integers(3, 11)
+    selected_vibe_indices = rng.choice(config.C_VIBE, size=num_vibe_tags, replace=False)
+    
+    vibe_weights = rng.exponential(scale=1.0, size=num_vibe_tags)
+    vibe_pref = np.zeros(config.C_VIBE)
+    vibe_pref[selected_vibe_indices] = vibe_weights
+    vibe_pref = vibe_pref / vibe_pref.sum()
+    
+    # 5. Behavior statistics (sample from configured ranges)
+    avg_sessions_per_week = float(rng.uniform(*config.SESSIONS_PER_WEEK_RANGE))
+    avg_views_per_session = float(rng.uniform(*config.VIEWS_PER_SESSION_RANGE))
+    avg_likes_per_session = float(rng.uniform(*config.LIKES_PER_SESSION_RANGE))
+    avg_saves_per_session = float(rng.uniform(*config.SAVES_PER_SESSION_RANGE))
+    avg_attends_per_month = float(rng.uniform(*config.ATTENDS_PER_MONTH_RANGE))
+    
+    # 6. Location behavior (concentrate on 1-3 neighborhoods)
+    num_frequent_neighborhoods = rng.integers(1, 4)
+    frequent_neighborhoods = rng.choice(
+        config.N_NEIGHBORHOODS_PER_CITY,
+        size=num_frequent_neighborhoods,
+        replace=False
+    )
+    
+    # Dirichlet over frequent neighborhoods
+    area_weights = rng.dirichlet([config.DIRICHLET_ALPHA_AREA] * num_frequent_neighborhoods)
+    area_freqs: Dict[int, float] = {}
+    for neigh_id, weight in zip(frequent_neighborhoods, area_weights):
+        area_freqs[int(neigh_id)] = float(weight)
+    
+    return UserSchema(
+        user_id=user_id,
+        home_city_id=int(home_city_id),
+        home_neighborhood_id=int(home_neighborhood_id),
+        cat_pref=cat_pref.tolist(),
+        fine_pref=fine_pref.tolist(),
+        vibe_pref=vibe_pref.tolist(),
+        area_freqs=area_freqs,
+        avg_sessions_per_week=avg_sessions_per_week,
+        avg_views_per_session=avg_views_per_session,
+        avg_likes_per_session=avg_likes_per_session,
+        avg_saves_per_session=avg_saves_per_session,
+        avg_attends_per_month=avg_attends_per_month
+    )
+
+
+def generate_all_users(config: SyntheticConfig) -> List[UserSchema]:
+    """
+    Generate all synthetic users.
+    
+    Args:
+        config: Generator configuration
+    
+    Returns:
+        List of UserSchema
+    """
+    rng = np.random.default_rng(config.RANDOM_SEED + 1)  # Different seed from places
+    
+    users = []
+    print(f"Generating {config.N_USERS} users...")
+    
+    for user_id in range(config.N_USERS):
+        if (user_id + 1) % 1000 == 0:
+            print(f"  Generated {user_id + 1}/{config.N_USERS} users")
+        
+        user = generate_user(user_id, config, rng)
+        users.append(user)
+    
+    print(f"✅ Generated {len(users)} users")
+    return users
+```
+
+### 7.4 Interaction Generation
+
+**File**: `recsys/synthetic/generate_interactions.py`
+
+```python
+"""
+Generate synthetic user-place interactions.
+"""
+
+import numpy as np
+from typing import List, Dict
+from datetime import datetime, timedelta
+from recsys.data.schemas import UserSchema, PlaceSchema, InteractionSchema, compute_implicit_rating
+from recsys.synthetic.generator_config import SyntheticConfig
+
+
+def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
+    """Compute cosine similarity between two vectors."""
+    dot = np.dot(a, b)
+    norm_a = np.linalg.norm(a)
+    norm_b = np.linalg.norm(b)
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return float(dot / (norm_a * norm_b))
+
+
+def compute_preference_score(
+    user: UserSchema,
+    place: PlaceSchema,
+    config: SyntheticConfig
+) -> float:
+    """
+    Compute preference score for user-place pair.
+    
+    Formula:
+    score = w1 * sim_interest + w2 * sim_cat + w3 * loc_factor + w4 * popularity + noise
+    """
+    # Interest similarity (cosine of fine prefs)
+    sim_interest = cosine_similarity(
+        np.array(user.fine_pref),
+        np.array(place.fine_tag_vector)
+    )
+    
+    # Category alignment (dot product)
+    sim_cat = np.dot(
+        np.array(user.cat_pref),
+        np.array(place.category_one_hot)
+    )
+    
+    # Location factor (higher if place in frequent neighborhoods)
+    loc_factor = user.area_freqs.get(place.neighborhood_id, 0.0)
+    
+    # Popularity factor (log-normalize)
+    popularity = np.log1p(place.base_popularity) / 10.0
+    
+    # Combine with weights
+    score = (
+        config.W_INTEREST * sim_interest +
+        config.W_CATEGORY * sim_cat +
+        config.W_LOCATION * loc_factor +
+        config.W_POPULARITY * popularity
+    )
+    
+    return max(0.0, score)  # Ensure non-negative
+
+
+def sample_interactions_for_user(
+    user: UserSchema,
+    places: List[PlaceSchema],
+    config: SyntheticConfig,
+    rng: np.random.Generator,
+    start_date: datetime
+) -> List[InteractionSchema]:
+    """
+    Sample interactions for a single user.
+    """
+    # 1. Determine number of interactions
+    n_interactions_raw = int(
+        user.avg_sessions_per_week *
+        config.TIME_HORIZON_WEEKS *
+        user.avg_views_per_session / 10.0  # Scale down
+    )
+    n_interactions = np.clip(
+        n_interactions_raw,
+        *config.INTERACTIONS_PER_USER_RANGE
+    )
+    
+    # 2. Get candidate places (same city, occasionally others)
+    same_city_places = [p for p in places if p.city_id == user.home_city_id]
+    
+    if len(same_city_places) < 20:
+        # If not enough places in city, use all places
+        candidate_places = places
+    else:
+        # 90% same city, 10% any city (travel)
+        if rng.random() < 0.9:
+            candidate_places = same_city_places
+        else:
+            candidate_places = places
+    
+    if len(candidate_places) == 0:
+        return []
+    
+    # 3. Compute preference scores for all candidates
+    scores = np.array([
+        compute_preference_score(user, place, config)
+        for place in candidate_places
+    ])
+    
+    # Add noise
+    scores = scores + rng.normal(0, 0.1, size=len(scores))
+    scores = np.maximum(scores, 0.0)
+    
+    # 4. Convert to probabilities via softmax
+    scores_exp = np.exp(scores - scores.max())  # Numerical stability
+    probs = scores_exp / scores_exp.sum()
+    
+    # 5. Sample places according to probabilities (with replacement)
+    sampled_indices = rng.choice(
+        len(candidate_places),
+        size=n_interactions,
+        replace=True,
+        p=probs
+    )
+    
+    # 6. Generate interaction details for each sampled place
+    interactions = []
+    
+    for idx in sampled_indices:
+        place = candidate_places[idx]
+        score = scores[idx]
+        
+        # Dwell time (higher score → more time)
+        base_dwell = 30.0  # seconds
+        dwell_time = base_dwell + score * 200.0 + rng.exponential(50.0)
+        dwell_time = max(5.0, min(600.0, dwell_time))  # Cap at 10 minutes
+        
+        # Actions (higher score → more actions)
+        action_prob = min(0.95, score * 2.0)
+        
+        num_likes = int(rng.random() < action_prob * 0.7)
+        num_saves = int(rng.random() < action_prob * 0.4)
+        num_shares = int(rng.random() < action_prob * 0.2)
+        attended = bool(rng.random() < action_prob * 0.1)  # Attending is rare
+        
+        # Implicit rating
+        implicit_rating = compute_implicit_rating(
+            dwell_time, num_likes, num_saves, num_shares, attended
+        )
+        
+        # Timestamp (random within time horizon)
+        days_offset = rng.integers(0, config.TIME_HORIZON_WEEKS * 7)
+        hours_offset = rng.integers(0, 24)
+        timestamp = start_date + timedelta(days=days_offset, hours=hours_offset)
+        
+        # Time buckets
+        hour = timestamp.hour
+        if hour < 6:
+            time_of_day_bucket = 3  # night
+        elif hour < 12:
+            time_of_day_bucket = 0  # morning
+        elif hour < 18:
+            time_of_day_bucket = 1  # afternoon
+        else:
+            time_of_day_bucket = 2  # evening
+        
+        day_of_week_bucket = 0 if timestamp.weekday() < 5 else 1  # weekday/weekend
+        
+        interaction = InteractionSchema(
+            user_id=user.user_id,
+            place_id=place.place_id,
+            dwell_time=float(dwell_time),
+            num_likes=num_likes,
+            num_saves=num_saves,
+            num_shares=num_shares,
+            attended=attended,
+            implicit_rating=float(implicit_rating),
+            timestamp=timestamp,
+            time_of_day_bucket=time_of_day_bucket,
+            day_of_week_bucket=day_of_week_bucket
+        )
+        
+        interactions.append(interaction)
+    
+    return interactions
+
+
+def generate_all_interactions(
+    users: List[UserSchema],
+    places: List[PlaceSchema],
+    config: SyntheticConfig,
+    start_date: datetime = None
+) -> List[InteractionSchema]:
+    """
+    Generate all user-place interactions.
+    
+    Args:
+        users: List of users
+        places: List of places
+        config: Generator configuration
+        start_date: Start date for timestamps
+    
+    Returns:
+        List of InteractionSchema
+    """
+    if start_date is None:
+        start_date = datetime(2024, 1, 1)
+    
+    rng = np.random.default_rng(config.RANDOM_SEED + 2)
+    
+    all_interactions = []
+    print(f"Generating interactions for {len(users)} users...")
+    
+    for i, user in enumerate(users):
+        if (i + 1) % 1000 == 0:
+            print(f"  Generated interactions for {i + 1}/{len(users)} users")
+        
+        user_interactions = sample_interactions_for_user(
+            user, places, config, rng, start_date
+        )
+        all_interactions.extend(user_interactions)
+    
+    print(f"✅ Generated {len(all_interactions)} interactions")
+    return all_interactions
+```
+
+### 7.5 User-User Edge and Friend Label Generation
+
+**File**: `recsys/synthetic/generate_user_user_edges.py`
+
+```python
+"""
+Generate synthetic user-user edges and friend labels.
+"""
+
+import numpy as np
+from typing import List, Dict, Tuple, Set
+from collections import defaultdict
+from recsys.data.schemas import UserSchema, InteractionSchema, UserUserEdgeSchema, FriendLabelSchema
+from recsys.synthetic.generator_config import SyntheticConfig
+
+
+def cosine_similarity_users(user_a: UserSchema, user_b: UserSchema) -> float:
+    """Compute cosine similarity between two users based on fine preferences."""
+    fine_a = np.array(user_a.fine_pref)
+    fine_b = np.array(user_b.fine_pref)
+    
+    dot = np.dot(fine_a, fine_b)
+    norm_a = np.linalg.norm(fine_a)
+    norm_b = np.linalg.norm(fine_b)
+    
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    
+    return float(dot / (norm_a * norm_b))
+
+
+def compute_neighborhood_overlap(user_a: UserSchema, user_b: UserSchema) -> float:
+    """
+    Compute overlap in area_freqs (Jaccard-like similarity).
+    """
+    neighborhoods_a = set(user_a.area_freqs.keys())
+    neighborhoods_b = set(user_b.area_freqs.keys())
+    
+    if len(neighborhoods_a) == 0 or len(neighborhoods_b) == 0:
+        return 0.0
+    
+    intersection = neighborhoods_a & neighborhoods_b
+    union = neighborhoods_a | neighborhoods_b
+    
+    return len(intersection) / len(union) if len(union) > 0 else 0.0
+
+
+def build_co_attendance_map(interactions: List[InteractionSchema]) -> Dict[Tuple[int, int], int]:
+    """
+    Build map of co-attendance counts.
+    
+    Returns:
+        Dict[(user_u, user_v)] -> count (where user_u < user_v)
+    """
+    # Group interactions by place and time window (day)
+    place_day_users: Dict[Tuple[int, int], Set[int]] = defaultdict(set)
+    
+    for interaction in interactions:
+        if not interaction.attended:
+            continue
+        
+        place_id = interaction.place_id
+        day = interaction.timestamp.date()
+        place_day_users[(place_id, day)].add(interaction.user_id)
+    
+    # Count co-attendances
+    co_attendance: Dict[Tuple[int, int], int] = defaultdict(int)
+    
+    for users_at_place in place_day_users.values():
+        users_list = list(users_at_place)
+        # Create pairs
+        for i in range(len(users_list)):
+            for j in range(i + 1, len(users_list)):
+                user_u = min(users_list[i], users_list[j])
+                user_v = max(users_list[i], users_list[j])
+                co_attendance[(user_u, user_v)] += 1
+    
+    return dict(co_attendance)
+
+
+def generate_social_edges(
+    users: List[UserSchema],
+    interactions: List[InteractionSchema],
+    config: SyntheticConfig
+) -> List[UserUserEdgeSchema]:
+    """
+    Generate user-user social edges.
+    
+    Args:
+        users: List of users
+        interactions: List of interactions (for co-attendance)
+        config: Generator configuration
+    
+    Returns:
+        List of UserUserEdgeSchema
+    """
+    rng = np.random.default_rng(config.RANDOM_SEED + 3)
+    
+    print("Building co-attendance map...")
+    co_attendance_map = build_co_attendance_map(interactions)
+    
+    print(f"Finding similar users for {len(users)} users...")
+    
+    # Build user index for fast lookup
+    user_dict = {user.user_id: user for user in users}
+    
+    edges = []
+    processed_pairs = set()
+    
+    for i, user_a in enumerate(users):
+        if (i + 1) % 1000 == 0:
+            print(f"  Processed {i + 1}/{len(users)} users")
+        
+        # Find similar users in same city
+        candidates = [
+            user_b for user_b in users
+            if user_b.user_id != user_a.user_id and
+            user_b.home_city_id == user_a.home_city_id
+        ]
+        
+        if len(candidates) == 0:
+            continue
+        
+        # Compute similarities
+        similarities = [
+            (user_b, cosine_similarity_users(user_a, user_b))
+            for user_b in candidates
+        ]
+        
+        # Sort by similarity
+        similarities.sort(key=lambda x: -x[1])
+        
+        # Take top-K similar users
+        top_similar = similarities[:config.K_SIMILAR_USERS]
+        
+        for user_b, sim_score in top_similar:
+            if sim_score < config.SIMILARITY_THRESHOLD:
+                continue
+            
+            # Ensure consistent ordering (smaller ID first)
+            user_u_id = min(user_a.user_id, user_b.user_id)
+            user_v_id = max(user_a.user_id, user_b.user_id)
+            
+            # Skip if already processed
+            if (user_u_id, user_v_id) in processed_pairs:
+                continue
+            
+            processed_pairs.add((user_u_id, user_v_id))
+            
+            user_u = user_dict[user_u_id]
+            user_v = user_dict[user_v_id]
+            
+            # Compute edge features
+            interest_overlap_score = sim_score
+            co_attendance_count = co_attendance_map.get((user_u_id, user_v_id), 0)
+            same_neighborhood_freq = compute_neighborhood_overlap(user_u, user_v)
+            
+            edge = UserUserEdgeSchema(
+                user_u=user_u_id,
+                user_v=user_v_id,
+                interest_overlap_score=float(interest_overlap_score),
+                co_attendance_count=int(co_attendance_count),
+                same_neighborhood_freq=float(same_neighborhood_freq)
+            )
+            
+            edges.append(edge)
+    
+    print(f"✅ Generated {len(edges)} social edges")
+    return edges
+
+
+def generate_friend_labels(
+    edges: List[UserUserEdgeSchema],
+    users: List[UserSchema],
+    config: SyntheticConfig
+) -> List[FriendLabelSchema]:
+    """
+    Generate friend compatibility labels from edges.
+    
+    Args:
+        edges: Social edges
+        users: List of users
+        config: Generator configuration
+    
+    Returns:
+        List of FriendLabelSchema
+    """
+    rng = np.random.default_rng(config.RANDOM_SEED + 4)
+    
+    print("Generating friend labels...")
+    
+    labels = []
+    
+    # Positive labels from edges
+    for edge in edges:
+        # Compatibility: high similarity or co-attendance
+        is_compatible = (
+            edge.interest_overlap_score >= 0.5 or
+            edge.co_attendance_count >= 2
+        )
+        
+        label_compat = 1 if is_compatible else 0
+        
+        # Attendance: probability based on similarity and co-attendance
+        attend_prob = min(
+            0.9,
+            edge.interest_overlap_score * 0.5 +
+            min(edge.co_attendance_count / 10.0, 0.4) +
+            edge.same_neighborhood_freq * 0.1
+        )
+        
+        label_attend = 1 if rng.random() < attend_prob else 0
+        
+        labels.append(FriendLabelSchema(
+            user_u=edge.user_u,
+            user_v=edge.user_v,
+            label_compat=label_compat,
+            label_attend=label_attend
+        ))
+    
+    # Negative labels (sample random pairs with no edge)
+    # Sample ~20% of positive labels as negatives
+    num_negatives = len(labels) // 5
+    
+    user_ids = [u.user_id for u in users]
+    edge_set = {(edge.user_u, edge.user_v) for edge in edges}
+    
+    attempts = 0
+    max_attempts = num_negatives * 10
+    
+    while len(labels) - len(edges) < num_negatives and attempts < max_attempts:
+        attempts += 1
+        
+        # Sample two random users
+        user_u_id, user_v_id = rng.choice(user_ids, size=2, replace=False)
+        user_u_id, user_v_id = min(user_u_id, user_v_id), max(user_u_id, user_v_id)
+        
+        # Skip if edge exists
+        if (user_u_id, user_v_id) in edge_set:
+            continue
+        
+        # Skip if already added as negative
+        if any(l.user_u == user_u_id and l.user_v == user_v_id for l in labels[len(edges):]):
+            continue
+        
+        # Negative label
+        labels.append(FriendLabelSchema(
+            user_u=user_u_id,
+            user_v=user_v_id,
+            label_compat=0,
+            label_attend=0
+        ))
+    
+    print(f"✅ Generated {len(labels)} friend labels ({len(edges)} positive, {len(labels) - len(edges)} negative)")
+    return labels
+```
+
+### 7.6 Orchestration Script
+
+**File**: `scripts/run_synthetic_generation.py`
+
+```python
+#!/usr/bin/env python3
+"""
+Master script to generate all synthetic data.
+"""
+
+import argparse
+import pandas as pd
+from pathlib import Path
+from datetime import datetime
+
+from recsys.synthetic.generator_config import get_default_config
+from recsys.synthetic.generate_places import generate_all_places
+from recsys.synthetic.generate_users import generate_all_users
+from recsys.synthetic.generate_interactions import generate_all_interactions
+from recsys.synthetic.generate_user_user_edges import generate_social_edges, generate_friend_labels
+
+
+def save_to_parquet(data_list, output_path: Path, name: str):
+    """Save list of dataclass objects to Parquet."""
+    # Convert dataclass to dict
+    data_dicts = [vars(item) for item in data_list]
+    df = pd.DataFrame(data_dicts)
+    df.to_parquet(output_path, index=False)
+    print(f"  Saved to {output_path}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Generate synthetic data for GNN training")
+    parser.add_argument(
+        "--output_dir",
+        type=str,
+        default="data",
+        help="Output directory for generated data"
+    )
+    parser.add_argument(
+        "--n_users",
+        type=int,
+        default=10_000,
+        help="Number of users to generate"
+    )
+    parser.add_argument(
+        "--n_places",
+        type=int,
+        default=10_000,
+        help="Number of places to generate"
+    )
+    args = parser.parse_args()
+    
+    # Create output directory
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    print("=" * 80)
+    print("SYNTHETIC DATA GENERATION")
+    print("=" * 80)
+    
+    # Load configuration
+    config = get_default_config()
+    config.N_USERS = args.n_users
+    config.N_PLACES = args.n_places
+    
+    print(f"\nConfiguration:")
+    print(f"  Users: {config.N_USERS}")
+    print(f"  Places: {config.N_PLACES}")
+    print(f"  Cities: {config.N_CITIES}")
+    print(f"  Random seed: {config.RANDOM_SEED}")
+    print()
+    
+    # Step 1: Generate places
+    print("Step 1/5: Generating places...")
+    places = generate_all_places(config)
+    save_to_parquet(places, output_dir / "places.parquet", "places")
+    print()
+    
+    # Step 2: Generate users
+    print("Step 2/5: Generating users...")
+    users = generate_all_users(config)
+    save_to_parquet(users, output_dir / "users.parquet", "users")
+    print()
+    
+    # Step 3: Generate interactions
+    print("Step 3/5: Generating interactions...")
+    start_date = datetime(2024, 1, 1)
+    interactions = generate_all_interactions(users, places, config, start_date)
+    save_to_parquet(interactions, output_dir / "interactions.parquet", "interactions")
+    print()
+    
+    # Step 4: Generate user-user edges
+    print("Step 4/5: Generating social edges...")
+    edges = generate_social_edges(users, interactions, config)
+    save_to_parquet(edges, output_dir / "user_user_edges.parquet", "social edges")
+    print()
+    
+    # Step 5: Generate friend labels
+    print("Step 5/5: Generating friend labels...")
+    friend_labels = generate_friend_labels(edges, users, config)
+    save_to_parquet(friend_labels, output_dir / "friend_labels.parquet", "friend labels")
+    print()
+    
+    # Summary
+    print("=" * 80)
+    print("GENERATION COMPLETE")
+    print("=" * 80)
+    print(f"\nGenerated data:")
+    print(f"  Users: {len(users)}")
+    print(f"  Places: {len(places)}")
+    print(f"  Interactions: {len(interactions)}")
+    print(f"  Social edges: {len(edges)}")
+    print(f"  Friend labels: {len(friend_labels)}")
+    print(f"\nFiles saved to: {output_dir.absolute()}")
+    print("\nNext steps:")
+    print("  1. Run scripts/run_build_features.py to build the graph")
+    print("  2. Run scripts/run_train_gnn.py to train the model")
+    print()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+**Usage**:
+
+```bash
+# Generate with defaults (10k users, 10k places)
+python scripts/run_synthetic_generation.py --output_dir data/
+
+# Generate smaller dataset for testing
+python scripts/run_synthetic_generation.py \
+    --output_dir data/test/ \
+    --n_users 1000 \
+    --n_places 1000
+
+# Generate larger dataset
+python scripts/run_synthetic_generation.py \
+    --output_dir data/full/ \
+    --n_users 50000 \
+    --n_places 20000
+```
+
+**Expected output**:
+
+```
+================================================================================
+SYNTHETIC DATA GENERATION
+================================================================================
+
+Configuration:
+  Users: 10000
+  Places: 10000
+  Cities: 8
+  Random seed: 42
+
+Step 1/5: Generating places...
+Generating 10000 places...
+  Generated 1000/10000 places
+  Generated 2000/10000 places
+  ...
+✅ Generated 10000 places
+  Saved to data/places.parquet
+
+Step 2/5: Generating users...
+Generating 10000 users...
+  Generated 1000/10000 users
+  ...
+✅ Generated 10000 users
+  Saved to data/users.parquet
+
+Step 3/5: Generating interactions...
+Generating interactions for 10000 users...
+  Generated interactions for 1000/10000 users
+  ...
+✅ Generated 2847293 interactions
+  Saved to data/interactions.parquet
+
+Step 4/5: Generating social edges...
+Building co-attendance map...
+Finding similar users for 10000 users...
+  Processed 1000/10000 users
+  ...
+✅ Generated 156432 social edges
+  Saved to data/user_user_edges.parquet
+
+Step 5/5: Generating friend labels...
+Generating friend labels...
+✅ Generated 187718 friend labels (156432 positive, 31286 negative)
+  Saved to data/friend_labels.parquet
+
+================================================================================
+GENERATION COMPLETE
+================================================================================
+
+Generated data:
+  Users: 10000
+  Places: 10000
+  Interactions: 2847293
+  Social edges: 156432
+  Friend labels: 187718
+
+Files saved to: /path/to/data
+
+Next steps:
+  1. Run scripts/run_build_features.py to build the graph
+  2. Run scripts/run_train_gnn.py to train the model
+```
 
 ---
 
